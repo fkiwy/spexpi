@@ -214,7 +214,15 @@ enabled, these files define wavelength-channel centers and edges used to bin rep
 Aperture photometry is performed on calibrated cutout images. The source aperture is centered on the epoch-adjusted
 target position. A local annulus is used to estimate the background, with configurable sigma clipping and background
 estimator (`mean`, `median`, or `mode`). Bad pixels are excluded from the source aperture and the background annulus.
-Known objects are masked only in the latter.
+Known-source pixels (`SOURCE`, bit 21) are masked in the annulus, but retained
+for the target measurement. QR3 rejects an unusable background instead of silently
+relaxing that mask. Background uncertainties use the number of samples surviving
+both masking and sigma clipping.
+
+QR3 also rejects apertures that lose source area through excluded/nonfinite
+pixels, invalid variance or image boundaries. `aperture_masked_policy="allow"`
+explicitly permits reporting the surviving flux without a missing-light correction;
+raw measurements identify that condition. QR2 retains its legacy allow default.
 
 The pipeline can measure multiple aperture radii for diagnostics but builds the final aperture spectrum from
 `selected_aperture_radius_pix`.
@@ -978,7 +986,8 @@ Parameters:
 - `aperture_radius_pix`: radius used for overlay diagnostics.
 - `background_inner_radius_pix`: inner annulus radius for overlay diagnostics.
 - `background_outer_radius_pix`: outer annulus radius for overlay diagnostics.
-- `fatal_flag_bits`: bit flags excluded from stacking.
+- `fatal_flag_bits`: optional override; None selects the release-specific mosaic policy.
+  Flagged science is masked before reprojection; original flag bits are propagated by OR.
 - `include_reference_image`: include the first exposure in the mean stack. Keep `True`
   (the default) when only one exposure is available per detector; `False` excludes it.
 - `overwrite`: overwrite stacked FITS files.
@@ -1154,14 +1163,58 @@ Create a compact object name from coordinates.
 
 | Parameter                  |                                                                        Default | Description                                                                                       |
 |----------------------------|-------------------------------------------------------------------------------:|---------------------------------------------------------------------------------------------------|
-| `bad_flag_bits`            | `(0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)` | SPHEREx `FLAGS` bits treated as fatal and excluded from photometry.                               |
-| `aperture_flag_count_bits` | `(0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)` | `FLAGS` bits counted inside apertures for diagnostics.                                            |
+| `bad_flag_bits` | `None` | Independent source exclusion override; None resolves the release default below. |
+| `background_flag_bits` | `None` | Independent annulus exclusion override; defaults include SOURCE (21). |
+| `aperture_flag_count_bits` | `None` | Diagnostic warning-count override, independent of source masking. |
+| `aperture_masked_policy` | `None` | QR3 resolves to `"reject"`, QR2 to `"allow"`; allow reports partial source flux without correcting it. |
+| `allow_source_background_fallback` | `None` | QR3 resolves to False, QR2 to True. Any SOURCE-mask relaxation is recorded. |
 | `sanitize_flux`            |                                                                         `True` | Remove non-finite flux/error values, zero placeholders, and invalid uncertainties before binning. |
 | `keep_negative_flux`       |                                                                         `True` | Keep negative background-subtracted fluxes; recommended for unbiased faint-source spectra.        |
 | `remove_outliers`          |                                                                        `False` | Apply detector-wise wavelength-bin outlier rejection before final binning.                        |
 | `outlier_detectors`        |                                                           `(1, 2, 3, 4, 5, 6)` | Detector numbers on which outlier rejection is applied.                                           |
 | `outlier_nbr_of_bins`      |                                                                            `8` | Number of wavelength bins per detector used for local outlier statistics.                         |
 | `outlier_sigma`            |                                                                          `3.0` | Sigma threshold for MAD-based outlier rejection.                                                  |
+
+
+The policies use L2 bit positions (`1 << bit`), not L3 measurement flags:
+
+```python
+# QR3 conservative source mask (not the shorter archive/Tractor fit policy):
+(0, 1, 2, 6, 7, 9, 10, 11, 14, 15, 17, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29)
+# QR3 annulus: the source default above plus SOURCE (21).
+# QR3 mosaics (archive mosaic policy; 1/19/21 are retained as warnings):
+(0, 2, 6, 7, 9, 10, 11, 14, 15, 17, 20, 22, 23, 24, 25, 26, 27, 28, 29)
+# QR2 legacy source and mosaic defaults:
+(0, 1, 2, 4, 6, 7, 9, 10, 11, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)
+```
+
+QR3 adds CROSSTALK (20), GHOST_FPA (23, currently unused) and STREAK (25), and
+omits the undefined bit 4. DICHROIC (7), PHANMISS (14), TRANSIENT (0), OVERFLOW (1)
+and OUTLIER (19) remain conservative source exclusions. FULLSAMPLE (12) is
+informational, and SOURCE (21) is not fatal for the target. An explicit empty tuple
+`()` disables that particular bit mask; the source, background and warning
+policies are independently configurable. `resolved_flag_bits(cfg, purpose)`
+returns the effective tuple (`purpose="source"`, `"background"` or `"warning"`).
+
+Raw measurements retain `warning_flags`, the OR of original L2 bits within 2.5
+pixels of the relevant source position. This includes informational flags and
+should not be interpreted as automatic rejection. Aperture diagnostics also
+record missing/covered area fractions, actual background sample count, background
+status and whether SOURCE masking was relaxed. `background_exclusion_mask` in a
+raw measurement records the actual mask used; FITS `BGMASK` records the configured
+policy. Spectrum headers include `SRCMASK`, `BGMASK`, and for apertures `APMASK`,
+`BGCOUNT=MASKCLIP` and `BGSRCFB`.
+
+Stacking selects its default mask from input release/version unless
+`fatal_flag_bits` is supplied. It masks raw science pixels before resampling and
+propagates contributor flags by bitwise OR, never bilinear interpolation of flag
+numbers. Missing coverage carries MISSING_DATA (9). Mixed mask/release policies
+within one detector stack are rejected. Stack headers record `FLAGPOL` and
+`MASKBITS`. These fixes can change image products and aperture uncertainties
+for QR2 as well as QR3; the QR2 exclusion defaults themselves are unchanged.
+
+See the [mask-policy validation](validation/QR3_FLAGS.md) for the rationale,
+regressions and differences from the original validation snapshot.
 
 ### Spectral oversampling reduction
 

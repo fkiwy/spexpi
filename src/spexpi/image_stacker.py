@@ -40,6 +40,9 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.nddata import Cutout2D
 from astropy.wcs import WCS
+from astropy.wcs.utils import pixel_to_pixel
+from spexpi.flag_policy import LEGACY_FATAL_BITS, QR3_MOSAIC_BITS, bitmask
+from packaging.version import Version
 from reproject import reproject_interp
 from reproject.mosaicking import find_optimal_celestial_wcs
 
@@ -51,29 +54,9 @@ DEFAULT_APERTURE_RADIUS_PIX = 2.0
 DEFAULT_BACKGROUND_INNER_RADIUS_PIX = 4.0
 DEFAULT_BACKGROUND_OUTER_RADIUS_PIX = 6.0
 
-# Detector FLAGS bits considered fatal for aperture/stacking purposes.
-# Any pixel with at least one of these bits set is excluded from the mean stack.
-DEFAULT_FATAL_FLAG_BITS = (
-    0,
-    1,
-    2,
-    4,
-    6,
-    7,
-    9,
-    10,
-    11,
-    14,
-    15,
-    17,
-    19,
-    22,
-    24,
-    26,
-    27,
-    28,
-    29,
-)
+# Backwards-compatible export of the legacy mask. None at the public entry
+# point resolves a per-file release policy; it does not mean this legacy tuple.
+DEFAULT_FATAL_FLAG_BITS = LEGACY_FATAL_BITS
 
 _REQUIRED_EXTENSIONS = ("IMAGE", "FLAGS", "ZODI")
 
@@ -102,6 +85,7 @@ class DetectorCutout:
     header: fits.Header
     flags: np.ndarray
     source_file: str
+    fatal_mask: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,21 +112,24 @@ def _build_fatal_mask(fatal_flag_bits: Sequence[int]) -> np.uint32:
         Combined FLAGS bit mask.
     """
 
-    return np.uint32(sum(1 << bit for bit in fatal_flag_bits))
+    return np.uint32(bitmask(fatal_flag_bits))
 
 
 def _as_uint_flags(flags: np.ndarray) -> np.ndarray:
     """Return FLAGS data as an unsigned integer array suitable for bit logic.
 
-    ``reproject_interp`` may return floating-point arrays even when the source
-    plane is an integer bit mask. For bitwise operations we need an integer
-    dtype. Values are cast to ``uint32`` without changing the array shape.
+    Signed 32-bit bitfields retain their bit pattern. Nonfinite coverage is
+    MISSING_DATA; fractional interpolated values are rejected, never truncated.
     """
 
     flags_array = np.asarray(flags)
-    if flags_array.dtype.kind not in ("i", "u", "b"):
-        return flags_array.astype(np.uint32, copy=False)
-    return flags_array.astype(np.uint32, copy=False)
+    if flags_array.dtype.kind == "i" and flags_array.dtype.itemsize <= 4:
+        return flags_array.astype(np.uint32)
+    finite = np.isfinite(flags_array)
+    if np.any(finite & ((flags_array < 0) | (flags_array > np.iinfo(np.uint32).max)
+                        | (flags_array != np.floor(flags_array)))):
+        raise ValueError("FLAGS must contain integer L2 bitfields; interpolated flag values are invalid")
+    return np.where(finite, flags_array, 1 << 9).astype(np.uint32)
 
 
 def _crop_center(data: np.ndarray, output_shape: tuple[int, int]) -> np.ndarray:
@@ -239,10 +226,53 @@ def _reproject_plane_to_optimal_wcs(
     return reprojected
 
 
+def _stack_mask_policy(hdul, path, override):
+    releases = {str(h.header.get("DATAREL", "")).lower() for h in hdul}
+    releases &= {"qr1", "qr2", "qr2_deep", "qr3"}
+    in_qr3_path = "qr3" in Path(path).parts
+    if len(releases) > 1 or (in_qr3_path and releases and releases != {"qr3"}):
+        raise ValueError("Conflicting release provenance in image stack input")
+    is_qr3 = "qr3" in releases or in_qr3_path
+    if not releases and not is_qr3:
+        try:
+            is_qr3 = Version(str(hdul[0].header.get("VERSION", "0"))).major >= 7
+        except ValueError:
+            pass
+    if override is not None:
+        return tuple(override), "qr3_custom" if is_qr3 else "legacy_custom"
+    return (QR3_MOSAIC_BITS, "qr3_mosaic") if is_qr3 else (LEGACY_FATAL_BITS, "legacy")
+
+
+def _reproject_flags(flags, header, wcs, shape):
+    """OR the bitfields of all nonzero bilinear input contributors.
+
+    Science interpolation uses these same neighboring input pixel centers.
+    Never interpolate integer bitfields numerically. Missing coverage is bit 9.
+    """
+    flags = _as_uint_flags(flags)
+    yy, xx = np.indices(shape)
+    sx, sy = pixel_to_pixel(wcs, WCS(header), xx, yy)
+    finite = np.isfinite(sx) & np.isfinite(sy)
+    sx, sy = np.where(finite, sx, 0.), np.where(finite, sy, 0.)
+    x0, y0 = np.floor(sx).astype(int), np.floor(sy).astype(int)
+    result = np.zeros(shape, dtype=np.uint32)
+    result[~finite] |= np.uint32(1 << 9)
+    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        px, py = x0+dx, y0+dy
+        weight = (1-np.abs(sx-px))*(1-np.abs(sy-py))
+        contributes = finite & (weight > 1.e-8)
+        inside = (px >= 0) & (py >= 0) & (px < flags.shape[1]) & (py < flags.shape[0])
+        valid = contributes & inside
+        result[valid] |= flags[py[valid], px[valid]]
+        result[contributes & ~inside] |= np.uint32(1 << 9)
+    return result
+
+
 def _extract_detector_cutout(
     fits_path: Path,
     target: SkyCoord,
     image_size_arcsec: float,
+    fatal_flag_bits=None,
 ) -> tuple[str, DetectorCutout]:
     """Read one FITS file and return a ZODI-subtracted detector cutout.
 
@@ -277,29 +307,30 @@ def _extract_detector_cutout(
         optimal_wcs, optimal_shape = find_optimal_celestial_wcs([image_hdu])
         cutout_size = image_size_arcsec * u.arcsec
 
-        image = _reproject_plane_to_optimal_wcs(image_hdu, optimal_wcs, optimal_shape)
+        bits, policy = _stack_mask_policy(hdul, fits_path, fatal_flag_bits)
+        fatal_mask = _build_fatal_mask(bits)
+        raw_flags = _as_uint_flags(flags_hdu.data)
+        science = np.asarray(image_hdu.data, dtype=float)-np.asarray(zodi_hdu.data, dtype=float)
+        science[(raw_flags & fatal_mask) != 0] = np.nan
+        # Mask before interpolation so flagged source flux cannot leak into
+        # neighboring output pixels. OR contributor flags conservatively.
+        science_hdu = fits.ImageHDU(science, header=image_hdu.header)
+        image = _reproject_plane_to_optimal_wcs(science_hdu, optimal_wcs, optimal_shape)
         image_cutout = Cutout2D(image, target, cutout_size, wcs=optimal_wcs, mode="partial")
-
-        zodi = _reproject_plane_to_optimal_wcs(zodi_hdu, optimal_wcs, optimal_shape)
-        zodi_cutout = Cutout2D(zodi, target, cutout_size, wcs=optimal_wcs, mode="partial")
-
-        flags = _reproject_plane_to_optimal_wcs(flags_hdu, optimal_wcs, optimal_shape)
-        flags_cutout = Cutout2D(
-            _as_uint_flags(flags),
-            target,
-            cutout_size,
-            wcs=optimal_wcs,
-            mode="partial",
-            fill_value=0,
-        )
-
-        science_minus_zodi = image_cutout.data - zodi_cutout.data
+        flags = _reproject_flags(raw_flags, image_hdu.header, optimal_wcs, optimal_shape)
+        flags_cutout = Cutout2D(flags, target, cutout_size, wcs=optimal_wcs,
+                                mode="partial", fill_value=1 << 9)
+        science_minus_zodi = image_cutout.data
+        output_header = image_cutout.wcs.to_header()
+        output_header["FLAGPOL"] = policy
+        output_header["MASKBITS"] = ",".join(str(b) for b in bits)
         cutout = DetectorCutout(
             date_obs=date_obs,
             data=science_minus_zodi,
-            header=image_cutout.wcs.to_header(),
+            header=output_header,
             flags=_as_uint_flags(flags_cutout.data),
             source_file=fits_path.name,
+            fatal_mask=int(fatal_mask),
         )
 
     return detector, cutout
@@ -310,13 +341,14 @@ def _group_cutouts_by_detector(
     target: SkyCoord,
     image_size_arcsec: float,
     verbose: bool,
+    fatal_flag_bits=None,
 ) -> DefaultDict[str, list[DetectorCutout]]:
     """Load all FITS files and group extracted cutouts by detector."""
 
     detector_cutouts: DefaultDict[str, list[DetectorCutout]] = defaultdict(list)
 
     for fits_path in fits_files:
-        detector, cutout = _extract_detector_cutout(fits_path, target, image_size_arcsec)
+        detector, cutout = _extract_detector_cutout(fits_path, target, image_size_arcsec, fatal_flag_bits)
         detector_cutouts[detector].append(cutout)
         if verbose:
             print(f"Loaded {fits_path.name} -> detector D{detector}")
@@ -341,6 +373,9 @@ def _mean_stack_detector_cutouts(
     if not cutouts:
         raise ValueError(f"No cutouts supplied for detector {detector}.")
 
+    policies = {c.header.get("FLAGPOL", "legacy") for c in cutouts}
+    if len(policies) > 1:
+        raise ValueError("Do not combine different release/mask policies in one detector stack")
     sorted_cutouts = sorted(cutouts, key=lambda item: item.date_obs)
     reference = sorted_cutouts[0]
     reference_shape = reference.data.shape
@@ -354,7 +389,8 @@ def _mean_stack_detector_cutouts(
         data = _crop_center(np.asarray(cutout.data, dtype=float), reference_shape)
         flags = _crop_center(_as_uint_flags(cutout.flags), reference_shape)
 
-        valid_flags = (flags & fatal_mask) == 0
+        selected_mask = fatal_mask if cutout.fatal_mask is None else cutout.fatal_mask
+        valid_flags = (flags & selected_mask) == 0
         valid_data = np.isfinite(data)
         valid_pixels = valid_flags & valid_data
 
@@ -410,7 +446,7 @@ def stack_images(
     aperture_radius_pix: float = DEFAULT_APERTURE_RADIUS_PIX,
     background_inner_radius_pix: float = DEFAULT_BACKGROUND_INNER_RADIUS_PIX,
     background_outer_radius_pix: float = DEFAULT_BACKGROUND_OUTER_RADIUS_PIX,
-    fatal_flag_bits: Sequence[int] = DEFAULT_FATAL_FLAG_BITS,
+    fatal_flag_bits: Sequence[int] | None = None,
     include_reference_image: bool = True,
     overwrite: bool = True,
     verbose: bool = True,
@@ -438,7 +474,8 @@ def stack_images(
         Aperture and background-annulus radii in pixels. These values are not
         used for the stacking itself; they are returned for downstream plotting.
     fatal_flag_bits:
-        FLAGS bit positions that should exclude pixels from the stack.
+        Override FLAGS exclusions. None selects the QR3 mosaic or legacy policy
+        from file provenance/version. Input science is masked before reprojection.
     include_reference_image:
         If ``True`` (recommended), include the first chronologically sorted
         cutout in the mean stack. If ``False``, reproduce the older behavior
@@ -494,7 +531,7 @@ def stack_images(
     )
 
     target = SkyCoord(ra, dec, unit="deg")
-    fatal_mask = _build_fatal_mask(fatal_flag_bits)
+    fatal_mask = _build_fatal_mask(DEFAULT_FATAL_FLAG_BITS if fatal_flag_bits is None else fatal_flag_bits)
 
     if verbose:
         print(f"Stacking {len(fits_files)} FITS file(s) for {source_name}")
@@ -504,6 +541,7 @@ def stack_images(
         target=target,
         image_size_arcsec=image_size_arcsec,
         verbose=verbose,
+        fatal_flag_bits=fatal_flag_bits,
     )
     if not detector_cutouts:
         raise ValueError("No detector cutouts were created from the input FITS files.")

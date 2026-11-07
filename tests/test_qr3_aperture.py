@@ -134,6 +134,11 @@ class QR3ApertureTests(unittest.TestCase):
         with fits.open(path,mode='update') as h:
             h['FLAGS'].data[15,15]=1
         spec,measurements=p.run_spherex_pipeline(24.24,9.56,'synthetic',self.cfg)
+        self.assertEqual(len(spec),0)
+        self.assertEqual(measurements[0]['aperture_status'],'rejected_missing_source_pixels')
+        self.cfg.aperture_masked_policy='allow'
+        spec,measurements=p.run_spherex_pipeline(24.24,9.56,'synthetic',self.cfg)
+        self.assertTrue(measurements[0]['aperture_missing_flux_allowed'])
         y,x=np.mgrid[:31,:31]
         source=np.exp(-((x-15.)**2+(y-15.)**2)/(2*.6**2))
         missing=1000./source.sum()

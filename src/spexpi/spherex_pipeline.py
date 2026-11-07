@@ -30,6 +30,7 @@ from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 from packaging.version import Version
+from spexpi.flag_policy import LEGACY_FATAL_BITS, QR3_SOURCE_BITS, QR3_BACKGROUND_BITS, QR3_WARNING_BITS, bitmask, validate_bits
 from photutils.psf import ImagePSF
 from photutils.aperture import CircularAnnulus, CircularAperture, ApertureStats, aperture_photometry
 from scipy.interpolate import PchipInterpolator
@@ -243,11 +244,23 @@ class PipelineConfig:
     # ------------------------------------------------------------------
     # Pixel flags, flux sanitation, and outlier rejection
     # ------------------------------------------------------------------
-    bad_flag_bits: tuple[int, ...] = (0, 1, 2, 4, 6, 7, 9, 10, 11, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)
-    """SPHEREx FLAGS bits treated as fatal and excluded from photometry."""
+    bad_flag_bits: tuple[int, ...] | None = None
+    """Source exclusions; None selects QR3 conservative or legacy QR2 defaults."""
 
-    aperture_flag_count_bits: tuple[int, ...] = (0, 1, 2, 4, 6, 7, 9, 10, 11, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)
-    """FLAGS bits counted inside apertures for diagnostics."""
+    background_flag_bits: tuple[int, ...] | None = None
+    """Independent annulus exclusions; defaults additionally mask SOURCE (21)."""
+
+    aperture_flag_count_bits: tuple[int, ...] | None = None
+    """Diagnostic warning bits, independent of source exclusion overrides."""
+
+    aperture_masked_policy: str | None = None
+    """'reject' or 'allow'; defaults to reject for QR3, legacy allow for QR2.
+    Reject includes lost aperture area at image/detector boundaries. Allow returns
+    the surviving flux without correcting missing stellar light and reports this.
+    """
+
+    allow_source_background_fallback: bool | None = None
+    """Permit SOURCE pixels if the annulus is otherwise unusable; QR3 False, QR2 True."""
 
     sanitize_flux: bool = True
     """Remove non-finite flux/error values, zero placeholders, and invalid uncertainties before binning."""
@@ -378,6 +391,12 @@ def validate_config(cfg: PipelineConfig) -> None:
     unsupported download backend or photometry method without trying to validate
     every scientific choice.
     """
+    for bits in (cfg.bad_flag_bits, cfg.background_flag_bits, cfg.aperture_flag_count_bits):
+        validate_bits(bits)
+    if cfg.allow_source_background_fallback is not None and not isinstance(cfg.allow_source_background_fallback, bool):
+        raise ValueError("allow_source_background_fallback must be bool or None")
+    if cfg.aperture_masked_policy not in (None, "reject", "allow"):
+        raise ValueError("aperture_masked_policy must be reject or allow")
     if cfg.data_release is not None and normalize_data_release(cfg.data_release) == "unknown":
         raise ValueError(f"Unsupported SPHEREx data_release={cfg.data_release!r}.")
     backend = str(cfg.download_backend).lower().strip()
@@ -1799,13 +1818,33 @@ def convert_variance_to_ujy2(var_data, image_header, sapm_data, sapm_header):
     return np.asarray(var_data, dtype=float) * scale ** 2
 
 
+def resolved_flag_bits(cfg, purpose="source"):
+    release = get_runtime_data_release(cfg, cfg.data_release or "unknown")
+    qr3 = release == "qr3"
+    overrides = {"source": cfg.bad_flag_bits, "background": cfg.background_flag_bits,
+                 "warning": cfg.aperture_flag_count_bits}
+    defaults = {"source": QR3_SOURCE_BITS if qr3 else LEGACY_FATAL_BITS,
+                "background": QR3_BACKGROUND_BITS if qr3 else (*LEGACY_FATAL_BITS, 21),
+                "warning": QR3_WARNING_BITS if qr3 else LEGACY_FATAL_BITS}
+    return tuple(defaults[purpose] if overrides[purpose] is None else overrides[purpose])
+
+
+def source_warning_flags(flags, x, y, radius=2.5):
+    """OR original L2 flags near the source, including non-fatal warnings."""
+    if flags is None or not np.isfinite(x) or not np.isfinite(y):
+        return 0
+    yy, xx = np.indices(flags.shape)
+    values = np.asarray(flags, dtype=np.uint32)[(xx-x)**2+(yy-y)**2 <= radius**2]
+    return int(np.bitwise_or.reduce(values, initial=np.uint32(0)))
+
+
 def make_bad_pixel_mask(flags, flux, bad_flag_bits: Iterable[int]):
     """Return a boolean mask for pixels carrying any configured fatal flag bit or non-finite flux."""
     bad_mask = np.zeros_like(flux, dtype=bool)
 
     if flags is not None:
-        mask_value = sum(1 << int(bit) for bit in bad_flag_bits)
-        bad_mask |= (np.asarray(flags) & mask_value) != 0
+        mask_value = bitmask(bad_flag_bits)
+        bad_mask |= (np.asarray(flags, dtype=np.uint32) & mask_value) != 0
 
     bad_mask |= ~np.isfinite(flux)
     return bad_mask
@@ -1819,8 +1858,8 @@ def count_bad_aperture_flags(flags, x, y, radius_pix, flag_bits):
     ap_mask = aperture.to_mask(method="center").to_image(flags.shape)
     if ap_mask is None:
         return 0
-    ap_flags = np.asarray(flags)[ap_mask > 0]
-    mask_value = sum(1 << int(bit) for bit in flag_bits)
+    ap_flags = np.asarray(flags, dtype=np.uint32)[ap_mask > 0]
+    mask_value = bitmask(flag_bits)
     return int(np.count_nonzero((ap_flags & mask_value) != 0))
 
 
@@ -2029,8 +2068,8 @@ def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfi
 
     valid = np.isfinite(cut) & np.isfinite(psf_cut) & np.isfinite(var_cut) & (var_cut > 0)
     if flags is not None:
-        flag_cut = flags[y1:y2, x1:x2]
-        fatal_mask = sum(1 << int(bit) for bit in cfg.bad_flag_bits)
+        flag_cut = np.asarray(flags[y1:y2, x1:x2], dtype=np.uint32)
+        fatal_mask = bitmask(resolved_flag_bits(cfg))
         valid &= ((flag_cut & fatal_mask) == 0)
 
     n_valid = int(np.count_nonzero(valid))
@@ -2221,88 +2260,89 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
 
 
 def aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius_pix,
-                             cfg: PipelineConfig, remove_known_sources=True):
-    """
-    Measure background-subtracted circular-aperture flux for one cutout.
+                             cfg: PipelineConfig, remove_known_sources=True, *, return_info=False):
+    """Background-subtracted aperture flux, with explicit missing-source policy.
 
-    The input image is already in uJy per pixel. The local background is
-    estimated in an annulus, optionally sigma-clipped, then subtracted from the
-    aperture sum. Negative fluxes are kept by default because they are valid
-    noisy measurements for faint sources.
+    The default four-value return is retained. return_info=True appends quality
+    diagnostics. Missing source flux is never silently aperture-corrected.
     """
+    qr3 = get_runtime_data_release(cfg, cfg.data_release or "unknown") == "qr3"
+    policy = cfg.aperture_masked_policy or ("reject" if qr3 else "allow")
+    if policy not in ("reject", "allow"):
+        raise ValueError("aperture_masked_policy must be reject or allow")
+    info = {"aperture_status": "bad_position", "aperture_masked_fraction": np.nan,
+            "aperture_coverage_fraction": np.nan, "background_npix": 0,
+            "background_status": "not_run", "background_source_mask_relaxed": False,
+            "aperture_missing_flux_allowed": False, "aperture_masked_policy": policy}
+    n_bad = 0
+    def finish(flux=np.nan, error=np.nan, area=np.nan):
+        result = (flux, error, area, n_bad)
+        return (*result, dict(info)) if return_info else result
     if not np.isfinite(x) or not np.isfinite(y):
-        return np.nan, np.nan, np.nan, 0
+        return finish()
     ny, nx = flux_ujy.shape
-    if x < 0 or y < 0 or x >= nx or y >= ny:
-        return np.nan, np.nan, np.nan, 0
-
+    if not (0 <= x < nx and 0 <= y < ny):
+        return finish()
     r = float(radius_pix)
     aperture = CircularAperture((x, y), r=r)
-    annulus = CircularAnnulus((x, y), r_in=cfg.annulus_inner_scale * r, r_out=cfg.annulus_outer_scale * r)
-
-    bad_mask = make_bad_pixel_mask(flags, flux_ujy, cfg.bad_flag_bits)
-
-    if remove_known_sources:
-        bkg_mask = make_bad_pixel_mask(flags, flux_ujy, cfg.bad_flag_bits + (21,))
-    else:
-        bkg_mask = bad_mask
-
-    sigclip = SigmaClip(sigma=cfg.sigma_clip_sigma, maxiters=cfg.sigma_clip_maxiters)
-    stats = ApertureStats(flux_ujy, annulus, mask=bkg_mask, sigma_clip=sigclip)
-
-    if cfg.bg_method == "mean":
-        bkg_per_pix = stats.mean
-    elif cfg.bg_method == "median":
-        bkg_per_pix = stats.median
-    elif cfg.bg_method == "mode":
-        bkg_per_pix = stats.mode
-    else:
-        raise ValueError(f"Unsupported background method: {cfg.bg_method}")
-
-    if bkg_per_pix is None or not np.isfinite(bkg_per_pix):
-        if remove_known_sources:
-            return aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius_pix, cfg,
-                                            remove_known_sources=False)
-        return np.nan, np.nan, np.nan, count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
-    ap_weight = aperture.to_mask(method="exact").to_image(flux_ujy.shape)
-    if ap_weight is None:
-        return np.nan, np.nan, np.nan, count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
-    valid_weight = np.where(bad_mask, 0.0, ap_weight)
-    ap_area = float(np.nansum(valid_weight))
-    if not np.isfinite(ap_area) or ap_area <= 0:
-        return np.nan, np.nan, np.nan, count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
-    phot = aperture_photometry(flux_ujy, aperture, mask=bad_mask, method="exact")
-    flux = float(phot["aperture_sum"][0]) - float(bkg_per_pix) * ap_area
-
+    annulus = CircularAnnulus((x, y), r_in=cfg.annulus_inner_scale*r, r_out=cfg.annulus_outer_scale*r)
+    source_bits = resolved_flag_bits(cfg)
+    background_bits = resolved_flag_bits(cfg, "background")
+    info["background_exclusion_mask"] = bitmask(background_bits)
+    n_bad = count_bad_aperture_flags(flags, x, y, r, resolved_flag_bits(cfg, "warning"))
+    bad_mask = make_bad_pixel_mask(flags, flux_ujy, source_bits)
     if var_ujy2 is not None:
-        var_mask = bad_mask | ~np.isfinite(var_ujy2)
-        vtab = aperture_photometry(var_ujy2, aperture, mask=var_mask, method="exact")
-        var_sum = float(vtab["aperture_sum"][0])
+        bad_mask |= ~np.isfinite(var_ujy2) | (var_ujy2 <= 0)
+    weights = aperture.to_mask(method="exact").to_image(flux_ujy.shape)
+    if weights is None:
+        return finish()
+    nominal_area = np.pi*r*r
+    observed_area = float(weights.sum())
+    valid_area = float(np.where(bad_mask, 0., weights).sum())
+    lost_area = max(0., nominal_area-valid_area)
+    info.update(aperture_coverage_fraction=observed_area/nominal_area,
+                aperture_masked_fraction=lost_area/nominal_area)
+    if valid_area <= 0 or (policy == "reject" and lost_area > nominal_area*1.e-8):
+        info["aperture_status"] = "rejected_missing_source_pixels"
+        return finish(area=valid_area)
+    info["aperture_missing_flux_allowed"] = lost_area > nominal_area*1.e-8
+    sigclip = SigmaClip(sigma=cfg.sigma_clip_sigma, maxiters=cfg.sigma_clip_maxiters)
+    def background(use_source_mask):
+        bits = background_bits if use_source_mask else tuple(b for b in background_bits if b != 21)
+        mask = make_bad_pixel_mask(flags, flux_ujy, bits)
+        info["background_exclusion_mask"] = bitmask(bits)
+        stats = ApertureStats(flux_ujy, annulus, mask=mask, sigma_clip=sigclip)
+        estimate = getattr(stats, cfg.bg_method)
+        # data_cutout includes geometric center masking, caller mask, NaNs and
+        # the actual sigma-clip rejection; count precisely those surviving pixels.
+        count = int(np.ma.count(stats.data_cutout))
+        return stats, estimate, count
+    stats, bkg, n_bg = background(remove_known_sources)
+    info["background_source_mask_relaxed"] = not remove_known_sources and 21 in background_bits
+    allow_fallback = cfg.allow_source_background_fallback
+    if allow_fallback is None:
+        allow_fallback = not qr3
+    if (bkg is None or not np.isfinite(bkg) or n_bg == 0) and remove_known_sources and allow_fallback and 21 in background_bits:
+        stats, bkg, n_bg = background(False)
+        info["background_source_mask_relaxed"] = True
+    info["background_npix"] = n_bg
+    if bkg is None or not np.isfinite(bkg) or n_bg == 0:
+        info.update(aperture_status="bad_background", background_status="unusable")
+        return finish(area=valid_area)
+    info["background_status"] = "source_mask_relaxed" if info["background_source_mask_relaxed"] else "ok"
+    phot = aperture_photometry(flux_ujy, aperture, mask=bad_mask, method="exact")
+    flux = float(phot["aperture_sum"][0])-float(bkg)*valid_area
+    if var_ujy2 is not None:
+        var_sum = float(aperture_photometry(var_ujy2, aperture, mask=bad_mask, method="exact")["aperture_sum"][0])
     else:
-        var_sum = 0.0
-
-    ann_mask_img = annulus.to_mask(method="center").to_image(flux_ujy.shape)
-    n_bg = int(np.count_nonzero((ann_mask_img > 0) & (~bad_mask))) if ann_mask_img is not None else 0
-
-    if n_bg > 0 and stats.std is not None and np.isfinite(stats.std):
-        var_bkg_per_pix = float(stats.std) ** 2 / n_bg
-    else:
-        var_bkg_per_pix = 0.0
-
-    if var_ujy2 is None and stats.std is not None and np.isfinite(stats.std):
-        var_sum = float(stats.std) ** 2 * ap_area
-
-    total_var = var_sum + ap_area ** 2 * var_bkg_per_pix
-    err = float(np.sqrt(total_var)) if total_var >= 0 else np.nan
-    n_bad = count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
+        var_sum = float(stats.std)**2*valid_area
+    var_background = float(stats.std)**2/n_bg
+    error = float(np.sqrt(var_sum+valid_area**2*var_background))
     if flux < 0 and not cfg.keep_negative_flux:
-        flux, err = np.nan, np.nan
-
-    return flux, err, ap_area, n_bad
+        info["aperture_status"] = "rejected_negative_flux"
+        return finish(area=valid_area)
+    info["aperture_status"] = "partial_source_flux" if info["aperture_missing_flux_allowed"] else "ok"
+    return finish(flux, error, valid_area)
 
 
 def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) -> list[dict]:
@@ -2321,6 +2361,8 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
         data_release = infer_data_release_from_header(header)
     if data_release == "unknown":
         raise ValueError("Cannot measure cutout because the SPHEREx data release is unknown.")
+    cfg = replace(cfg)
+    set_runtime_data_release(cfg, data_release)
     require_supported_photometry(data_release, cfg)
 
     sapm_key = (data_release, detector)
@@ -2364,7 +2406,8 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
 
     if method in ("aperture", "both"):
         for radius in get_aperture_radii_for_detector(cfg, detector):
-            flux_uJy, err_uJy, area_pix, n_bad = aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius, cfg)
+            flux_uJy, err_uJy, area_pix, n_bad, aperture_info = aperture_flux_one_radius(
+                flux_ujy, var_ujy2, flags, x, y, radius, cfg, return_info=True)
             measurements.append({
                 "wavelength": float(row["central_wavelength_um"]),
                 "bandwidth_um": row.get("bandwidth_um", np.nan),
@@ -2394,6 +2437,9 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
                 "epoch_projection_status": row.get("epoch_projection_status", ""),
                 "epoch_projection_sep_arcsec": row.get("epoch_projection_sep_arcsec", np.nan),
                 **sapm_info,
+                **aperture_info,
+                "warning_flags": source_warning_flags(flags, x, y),
+                "source_exclusion_mask": bitmask(resolved_flag_bits(cfg)),
                 "status": "ok" if np.isfinite(flux_uJy) and np.isfinite(err_uJy) and err_uJy > 0 else "bad_photometry",
             })
 
@@ -2451,10 +2497,10 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
             "aperture_area_pix": np.nan,
             "n_bad_aperture_pixels": count_bad_aperture_flags(
                 flags,
-                x,
-                y,
+                psf_info.get("psf_x_fit", x),
+                psf_info.get("psf_y_fit", y),
                 get_selected_aperture_radius_pix(cfg, detector),
-                cfg.aperture_flag_count_bits,
+                resolved_flag_bits(cfg, "warning"),
             ),
             "x": psf_info.get("psf_x_fit", x),
             "y": psf_info.get("psf_y_fit", y),
@@ -2476,6 +2522,8 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
             **sapm_info,
             "status": "ok" if np.isfinite(psf_flux_uJy) and np.isfinite(psf_err_uJy) and psf_err_uJy > 0 and psf_info.get("psf_status") == "ok" else "bad_photometry",
             **psf_info,
+            "warning_flags": source_warning_flags(flags, psf_info.get("psf_x_fit", x), psf_info.get("psf_y_fit", y)),
+            "source_exclusion_mask": bitmask(resolved_flag_bits(cfg)),
         })
 
     return measurements
@@ -3348,6 +3396,12 @@ def save_spectrum_fits(
     if cfg.pmdec_masyr is not None:
         hdu0.header["PMDEC"] = (float(cfg.pmdec_masyr), "Proper motion Dec [mas/yr]")
     hdu0.header["PHOTMET"] = (method, "Photometry method used for this spectrum")
+    hdu0.header["SRCMASK"] = bitmask(resolved_flag_bits(cfg))
+    hdu0.header["BGMASK"] = bitmask(resolved_flag_bits(cfg, "background"))
+    if method == "aperture":
+        hdu0.header["APMASK"] = cfg.aperture_masked_policy or ("reject" if data_release == "qr3" else "allow")
+        hdu0.header["BGCOUNT"] = ("MASKCLIP", "Count surviving annulus samples after masking/clipping")
+        hdu0.header["BGSRCFB"] = (cfg.allow_source_background_fallback if cfg.allow_source_background_fallback is not None else data_release != "qr3")
     if data_release == "qr3" and method == "psf":
         hdu0.header["PSFMODEL"] = "EPSF"
         hdu0.header["PSFNORM"] = ("FULL", "Normalize native full model before fit-window clipping")

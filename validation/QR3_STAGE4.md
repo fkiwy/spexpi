@@ -2,6 +2,10 @@
 
 Validation date: 7 November 2026. Scientific pipeline revision tested:
 `585f121e4568f13babb72b98b71a3c046f46ad73`.
+This is a historical snapshot before the subsequent [flag-policy and background
+uncertainty fixes](QR3_FLAGS.md). The current runner records intentional aperture
+error corrections separately while enforcing legacy QR2 flux and PSF-error checks.
+
 Original `master` baseline: `96b9ff95b4497f18b7cfc75dc6b38bcb3aff1b0f`.
 
 The local compatibility checks pass. The separate comparison with IRSA's remote

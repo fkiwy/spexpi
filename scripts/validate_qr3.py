@@ -23,6 +23,7 @@ import numpy as np
 from photutils.psf import ImagePSF
 import requests
 from spexpi import spherex_pipeline as p
+from spexpi import flag_policy
 
 TARGET = dict(name='SIMP_J013656_validation', ra=24.2412498, dec=9.5630705,
               reference_epoch_yr=2016., pmra_masyr=1238.244, pmdec_masyr=-16.156)
@@ -73,7 +74,7 @@ def reference_epsf_fit(path, row, cfg, sapm, sapm_header):
         data = (hdul['IMAGE'].data[yy,xx]-hdul['ZODI'].data[yy,xx])*scale
         variance = hdul['VARIANCE'].data[yy,xx]*scale**2
         flags = hdul['FLAGS'].data[yy,xx]
-        mask = sum(1<<bit for bit in cfg.bad_flag_bits)
+        mask = sum(1<<bit for bit in p.resolved_flag_bits(cfg))
         valid = np.isfinite(data)&np.isfinite(variance)&(variance>0)&((flags&mask)==0)
         design = np.column_stack([native[valid], np.ones(valid.sum()),
                                   (xx-x)[valid], (yy-y)[valid]])
@@ -147,10 +148,23 @@ def validate_case(case, root, online, baseline):
                 psf_fit_background_gradient=True,aperture_radii_pix=(2.,),selected_aperture_radius_pix=2.)
             # Identical FITS and calibration inputs isolate numerical extraction changes.
             old=baseline.measure_cutout_photometry(row,dict(maps),old_cfg)
-            output['baseline_max_abs_difference_uJy']=max(
-                abs(a[k]-b[k]) for a,b in zip(measurements,old) for k in ('flux_uJy','err_uJy'))
-            if len(old)!=len(measurements) or output['baseline_max_abs_difference_uJy']>1.e-8:
-                raise AssertionError('QR2 extraction differs from original master')
+            if len(old)!=len(measurements):
+                raise AssertionError('QR2 baseline measurement count differs')
+            flux_difference=max(abs(a['flux_uJy']-b['flux_uJy']) for a,b in zip(measurements,old))
+            psf_error_difference=max(abs(a['err_uJy']-b['err_uJy']) for a,b in zip(measurements,old)
+                                     if a['photometry_method']=='psf')
+            aperture_error_change=[a['err_uJy']-b['err_uJy'] for a,b in zip(measurements,old)
+                                   if a['photometry_method']=='aperture']
+            output['baseline_max_abs_flux_difference_uJy']=flux_difference
+            output['baseline_max_abs_psf_error_difference_uJy']=psf_error_difference
+            output['aperture_background_error_change_uJy']=aperture_error_change
+            # Corrected annulus counts intentionally change aperture errors.
+            # Flux and PSF-covariance behavior must retain the legacy baseline.
+            if flux_difference>1.e-8 or psf_error_difference>1.e-8:
+                raise AssertionError('QR2 flux/PSF error differs from original master')
+            if any(change < -1.e-8 for change in aperture_error_change):
+                raise AssertionError('Aperture error unexpectedly decreased versus old background count')
+
         return output
     finally:
         if not online:
@@ -245,7 +259,9 @@ def main():
     if len(cases)!=12 or {(case['release'],case['detector']) for case in cases} != expected:
         parser.error('Manifest must contain exactly one case per release and detector')
     baseline=load_baseline(args.baseline_file) if args.baseline_file else None
-    provenance=dict(baseline_comparison_requested=bool(args.baseline_file),pipeline_sha256=hashlib.sha256(Path(p.__file__).read_bytes()).hexdigest(),
+    provenance=dict(flag_policy_sha256=hashlib.sha256(Path(flag_policy.__file__).read_bytes()).hexdigest(),
+                    validation_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    baseline_comparison_requested=bool(args.baseline_file),pipeline_sha256=hashlib.sha256(Path(p.__file__).read_bytes()).hexdigest(),
                     baseline_sha256=(hashlib.sha256(args.baseline_file.read_bytes()).hexdigest()
                                      if args.baseline_file else None))
     results=[]
