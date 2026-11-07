@@ -7,6 +7,8 @@ import logging
 import math
 import re
 import time
+import threading
+import tempfile
 import urllib.parse
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -30,7 +32,7 @@ from matplotlib.ticker import ScalarFormatter
 from packaging.version import Version
 from photutils.aperture import CircularAnnulus, CircularAperture, ApertureStats, aperture_photometry
 from scipy.interpolate import PchipInterpolator
-from scipy.ndimage import shift as ndi_shift
+from scipy.ndimage import shift as ndi_shift, map_coordinates
 from tqdm.auto import tqdm
 
 VERSION_FIXED = Version("6.5.6")
@@ -41,9 +43,12 @@ RELEASE_CALIBRATIONS = {
     "qr1": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
     "qr2": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
     "qr2_deep": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
-    "qr3": {"sapm": "cal-sapm-v3-2026-191", "spectral_channels": "cal-sch-v2-2026-229"},
+    "qr3": {"sapm": "cal-sapm-v3-2026-191", "spectral_channels": "cal-sch-v2-2026-229",
+            "spectral_wcs": "cal-swcs-v5-2026-191"},
 }
 
+
+_CALIBRATION_LOCK = threading.RLock()
 
 logging.getLogger("astropy").setLevel(logging.WARNING)
 
@@ -56,8 +61,8 @@ class PipelineConfig:
     Select data_release to query or read a single release, or leave it unset
     to infer an unambiguous release from all inputs. Calibration paths, cutout
     caches and outputs are scoped by release. Unknown or mixed provenance is
-    rejected. QR3 extraction remains gated until its calibration and EPSF
-    processing stages are implemented.
+    rejected. QR3 aperture extraction uses full-resolution wavelength maps;
+    QR3 PSF and combined extraction await the EPSF processing stage.
     """
 
     # ------------------------------------------------------------------
@@ -149,6 +154,15 @@ class PipelineConfig:
 
     sapm_collection: str | None = None
     """Explicit SAPM collection override; None selects the release-specific default."""
+
+    spectral_wcs_cache_dir: str = "spherex_calibration_files/spherex_spectral_wcs_cache"
+    """Full-resolution QR3 CWAVE/CBAND cache, grouped by release and collection."""
+
+    spectral_wcs_collection: str | None = None
+    """Override the release-specific spectral-WCS collection."""
+
+    redownload_spectral_wcs: bool = False
+    """Refresh spectral WCS files once per detector in the current run."""
 
     # ------------------------------------------------------------------
     # Aperture photometry and local background estimation
@@ -828,10 +842,15 @@ def calibration_collection(cfg: PipelineConfig, data_release: str, kind: str) ->
     release = normalize_data_release(data_release)
     if release == "unknown":
         raise ValueError("Cannot select calibration: unknown SPHEREx data release.")
-    if kind not in ("sapm", "spectral_channels"):
+    fields = {"sapm": cfg.sapm_collection, "spectral_channels": cfg.spectral_channels_collection,
+              "spectral_wcs": cfg.spectral_wcs_collection}
+    if kind not in fields:
         raise ValueError(f"Unsupported calibration kind: {kind}")
-    override = cfg.sapm_collection if kind == "sapm" else cfg.spectral_channels_collection
-    return override or RELEASE_CALIBRATIONS[release][kind]
+    if fields[kind]:
+        return fields[kind]
+    if kind not in RELEASE_CALIBRATIONS[release]:
+        raise ValueError(f"No default {kind} calibration for {release}.")
+    return RELEASE_CALIBRATIONS[release][kind]
 
 
 def require_single_data_release(rows: list[dict], selected: str | None = None) -> str:
@@ -1019,37 +1038,127 @@ def query_spherex_cutouts(ra: float, dec: float, cfg: PipelineConfig) -> Table:
     return table
 
 
-def load_sapm(detector: int, cfg: PipelineConfig, data_release: str):
-    """
-    Load the solid-angle pixel map for one detector and one inferred release.
-
-    If cfg.cache_sapm_files=True, the SAPM file is cached locally and reused.
-    """
-    detector = int(detector)
-    release = normalize_data_release(data_release)
-    if release == "unknown":
-        raise ValueError("Cannot load SAPM calibration because the SPHEREx data release is unknown.")
-    s3_path = make_sapm_s3_paths(cfg, release)[detector]
-    local_path = sapm_local_path(detector, cfg, release)
-
-    if cfg.cache_sapm_files:
-        if local_path.exists() and local_path.stat().st_size > 0 and not cfg.redownload_sapm_files:
-            with fits.open(local_path) as hdul:
-                return hdul["IMAGE"].data.astype(float), hdul["IMAGE"].header.copy()
-
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = local_path.with_suffix(local_path.suffix + ".part")
-
-        with fits.open(f"s3://{s3_path}", fsspec_kwargs={"anon": True}) as hdul:
-            hdul.writeto(tmp_path, overwrite=True)
-
+def download_calibration(s3_path: str, local_path: Path, timeout: float = 120) -> None:
+    """Stream a public archive object over verified HTTPS and publish it atomically."""
+    bucket, key = s3_path.removeprefix("s3://").split("/", 1)
+    url = f"https://{bucket}.s3.amazonaws.com/{key}"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = local_path.with_name(local_path.name + ".part")
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as response:
+            response.raise_for_status()
+            with tmp_path.open("wb") as output:
+                for chunk in response.iter_content(1024 * 1024):
+                    output.write(chunk)
+        with fits.open(tmp_path) as hdul:
+            hdul.verify("exception")
         tmp_path.replace(local_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-        with fits.open(local_path) as hdul:
-            return hdul["IMAGE"].data.astype(float), hdul["IMAGE"].header.copy()
 
-    with fits.open(f"s3://{s3_path}", fsspec_kwargs={"anon": True}) as hdul:
-        return hdul["IMAGE"].data.astype(float), hdul["IMAGE"].header.copy()
+def load_sapm(detector: int, cfg: PipelineConfig, data_release: str):
+    """Load the release-specific pixel-area map, retaining its sky orientation."""
+    release = normalize_data_release(data_release)
+    if not cfg.cache_sapm_files:
+        # A no-cache request must never replace/delete an existing persistent file.
+        with tempfile.TemporaryDirectory(prefix="spexpi-sapm-") as directory:
+            path = Path(directory) / "sapm.fits"
+            download_calibration(make_sapm_s3_paths(cfg, release)[int(detector)], path,
+                                 cfg.request_timeout_sec)
+            return read_sapm(path, detector, release)
+    local_path = sapm_local_path(detector, cfg, release)
+    with _CALIBRATION_LOCK:
+        if cfg.redownload_sapm_files or not local_path.exists():
+            download_calibration(make_sapm_s3_paths(cfg, release)[int(detector)], local_path,
+                                 cfg.request_timeout_sec)
+        return read_sapm(local_path, detector, release)
+
+
+def read_sapm(path, detector, release):
+    with fits.open(path) as hdul:
+        image = hdul["IMAGE"]
+        if release == "qr3" and image.header.get("DETCOORD", "").strip().lower() != "sky":
+            raise ValueError("QR3 SAPM must use sky detector coordinates.")
+        if int(image.header.get("DETECTOR", detector)) != int(detector):
+            raise ValueError("SAPM detector does not match image detector.")
+        if image.data.ndim != 2:
+            raise ValueError("SAPM must be a 2D pixel-area map.")
+        return image.data.astype(float), image.header.copy()
+
+
+def load_spectral_wcs(detector: int, cfg: PipelineConfig, data_release: str):
+    """Load full-resolution wavelength maps once per run and detector (thread safe)."""
+    release = normalize_data_release(data_release)
+    coll = calibration_collection(cfg, release, "spectral_wcs")
+    key = (release, int(detector), coll)
+    with _CALIBRATION_LOCK:
+        cache = getattr(cfg, "_spectral_wcs_maps", None)
+        if cache is None:
+            cache = cfg._spectral_wcs_maps = {}
+        if key not in cache:
+            filename = f"spectral_wcs_D{int(detector)}_spx_{coll}.fits"
+            path = Path(cfg.spectral_wcs_cache_dir) / release / coll / filename
+            if cfg.redownload_spectral_wcs or not path.exists():
+                download_calibration(f"nasa-irsa-spherex/{release}/spectral_wcs/{coll}/{int(detector)}/{filename}",
+                                     path, cfg.request_timeout_sec)
+            with fits.open(path) as hdul:
+                maps = []
+                for name in ("CWAVE", "CBAND"):
+                    hdu = hdul[name]
+                    if hdu.header.get("DETCOORD", hdul[0].header.get("DETCOORD", "")).strip().lower() != "sky":
+                        raise ValueError("Spectral WCS maps must use sky detector coordinates.")
+                    if int(hdu.header.get("DETECTOR", detector)) != int(detector):
+                        raise ValueError("Spectral WCS detector does not match image detector.")
+                    maps.append((hdu.data * Unit(hdu.header["BUNIT"])).to_value(u.um))
+                if maps[0].ndim != 2 or maps[0].shape != maps[1].shape:
+                    raise ValueError("CWAVE and CBAND must be matching 2D maps.")
+                cache[key] = tuple(maps)
+        return cache[key]
+
+
+def qr3_parent_coordinates(header, image_shape, parent_shape):
+    """Require the standard untranslated/scaled sky grid before mapping a QR3 cutout."""
+    if header.get("DETCOORD", "").strip().lower() != "sky":
+        raise ValueError("QR3 image must use sky detector coordinates.")
+    for i in (1, 2):
+        for j in (1, 2):
+            expected = 1. if i == j else 0.
+            if (not np.isclose(header.get(f"PC{i}_{j}A", expected), expected)
+                    or not np.isclose(header.get(f"CD{i}_{j}A", expected), expected)):
+                raise ValueError("Unsupported rotated QR3 parent-detector WCS.")
+    if "CRPIX1A" not in header or "CRPIX2A" not in header:
+        if tuple(image_shape) != tuple(parent_shape):
+            raise ValueError("QR3 cutout is missing parent-detector CRPIX*A offsets.")
+        return 0., 0.
+    for axis in (1, 2):
+        if (not np.isclose(header.get(f"CDELT{axis}A", 1), 1)
+                or not np.isclose(header.get(f"CRVAL{axis}A", 0), 0)):
+            raise ValueError("Unsupported QR3 parent-detector linear WCS.")
+    offsets = (1. - float(header["CRPIX1A"]), 1. - float(header["CRPIX2A"]))
+    if not all(np.isfinite(v) and np.isclose(v, round(v)) for v in offsets):
+        raise ValueError("QR3 cutout offsets must be finite integer detector pixels.")
+    return offsets
+
+
+def qr3_wavelength(header, image_shape, x, y, detector, cfg):
+    """Bilinearly sample full-resolution CWAVE and CBAND at the source position."""
+    cwave, cband = load_spectral_wcs(detector, cfg, "qr3")
+    dx, dy = qr3_parent_coordinates(header, image_shape, cwave.shape)
+    xp, yp = float(x) + dx, float(y) + dy
+    if not (np.isfinite(xp) and np.isfinite(yp) and 0 <= xp <= cwave.shape[1] - 1
+            and 0 <= yp <= cwave.shape[0] - 1):
+        raise ValueError("Source lies outside the full-resolution spectral WCS map.")
+    values = [float(map_coordinates(m, [[yp], [xp]], order=1, mode="constant", cval=np.nan,
+                                    prefilter=False)[0]) for m in (cwave, cband)]
+    if not all(np.isfinite(v) and v > 0 for v in values):
+        raise ValueError("Nonpositive or nonfinite CWAVE/CBAND at source position.")
+    return values
+
+
+def require_supported_photometry(release, cfg):
+    if release == "qr3" and str(cfg.photometry_method).strip().lower() != "aperture":
+        raise NotImplementedError("QR3 supports aperture photometry only; EPSF photometry is not implemented yet.")
 
 
 def detector_from_header(header) -> int:
@@ -1219,12 +1328,11 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
     release = require_single_data_release(
         [{"data_release": r} for r in known] or [{"data_release": "unknown"}], cfg.data_release
     )
-    if release == "qr3":
-        raise NotImplementedError("QR3 cutout processing requires the calibration/aperture and EPSF stages.")
+    require_supported_photometry(release, cfg)
     for attempt in range(cfg.retries):
         try:
             with fits.open(open_path) as old_hdul:
-                hdul = update_psf_header(old_hdul)
+                hdul = old_hdul if release == "qr3" else update_psf_header(old_hdul)
                 image_hdu = hdul["IMAGE"].copy()
                 flags_hdu = hdul["FLAGS"].copy() if "FLAGS" in hdul else None
                 var_hdu = hdul["VARIANCE"].copy() if "VARIANCE" in hdul else None
@@ -1233,7 +1341,7 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
 
                 header = image_hdu.header
                 detector = detector_from_header(header)
-                data_release = normalize_data_release(row.get("data_release", "unknown"))
+                data_release = release
                 if data_release == "unknown":
                     data_release = infer_data_release_from_header(header)
                 if data_release == "unknown":
@@ -1249,8 +1357,9 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                         stamp_data_release_in_fits(open_path, data_release)
 
                 spatial_wcs = WCS(header)
-                spectral_wcs = WCS(header=header, fobj=hdul, key="W")
-                spectral_wcs.sip = None
+                if release != "qr3":
+                    spectral_wcs = WCS(header=header, fobj=hdul, key="W")
+                    spectral_wcs.sip = None
 
                 obs_mjd = mjd_from_header(header)
                 adj_ra, adj_dec, projection_status = project_to_epoch(
@@ -1269,7 +1378,12 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
 
                 target = SkyCoord(ra=adj_ra, dec=adj_dec, unit="deg", frame="icrs")
                 x_src, y_src = spatial_wcs.world_to_pixel(target)
-                wl_src, _ = spectral_wcs.pixel_to_world(x_src, y_src)
+                if release == "qr3":
+                    wavelength_um, bandwidth_um = qr3_wavelength(
+                        header, image_hdu.data.shape, x_src, y_src, detector, cfg)
+                else:
+                    wl_src, _ = spectral_wcs.pixel_to_world(x_src, y_src)
+                    wavelength_um, bandwidth_um = float(wl_src.to(u.um).value), np.nan
 
                 try:
                     sep_as = SkyCoord(ra, dec, unit="deg").separation(SkyCoord(adj_ra, adj_dec, unit="deg")).arcsec
@@ -1300,7 +1414,9 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                     "psf_hdu": psf_hdu,
                     "x_src": float(x_src),
                     "y_src": float(y_src),
-                    "central_wavelength_um": float(wl_src.to(u.um).value),
+                    "central_wavelength_um": wavelength_um,
+                    "bandwidth_um": bandwidth_um,
+                    "wavelength_source": "CWAVE" if release == "qr3" else "WCS-WAVE",
                 }
         except Exception as exc:
             last_exc = exc
@@ -1313,6 +1429,7 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
         "data_release": normalize_data_release(row.get("data_release", infer_data_release_from_uri(str(open_path)))),
         "cutout_index": int(row["cutout_index"]),
         "status": f"open_failed:{type(last_exc).__name__}",
+        "open_error": str(last_exc),
     }
 
 
@@ -1663,14 +1780,14 @@ def convert_to_ujy(image_data, image_header, sapm_data, sapm_header):
     """Convert an IMAGE array from surface-brightness units to per-pixel uJy."""
     bunit = Unit(image_header.get("BUNIT", "MJy/sr"))
     sapm_unit = Unit(sapm_header.get("BUNIT", "arcsec2"))
-    return ((image_data * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).value
+    return ((image_data * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).to_value(u.uJy)
 
 
 def convert_variance_to_ujy2(var_data, image_header, sapm_data, sapm_header):
     """Convert a VARIANCE array consistently with convert_to_ujy, returning uJy^2."""
     bunit = Unit(image_header.get("BUNIT", "MJy/sr"))
     sapm_unit = Unit(sapm_header.get("BUNIT", "arcsec2"))
-    scale = ((1.0 * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).value
+    scale = ((1.0 * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).to_value(u.uJy)
     return np.asarray(var_data, dtype=float) * scale ** 2
 
 
@@ -2120,11 +2237,17 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
         data_release = infer_data_release_from_header(header)
     if data_release == "unknown":
         raise ValueError("Cannot measure cutout because the SPHEREx data release is unknown.")
+    require_supported_photometry(data_release, cfg)
 
     sapm_key = (data_release, detector)
     if sapm_key not in sapm_cache:
         sapm_cache[sapm_key] = load_sapm(detector, cfg, data_release)
     sapm_data, sapm_header = sapm_cache[sapm_key]
+    require_supported_photometry(data_release, cfg)
+    if data_release == "qr3":
+        qr3_parent_coordinates(header, image.shape, sapm_data.shape)
+        if sapm_header.get("DETCOORD", "").strip().lower() != "sky":
+            raise ValueError("QR3 pixel-area map must use sky detector coordinates.")
 
     sapm_use, image_slices, sapm_info = extract_sapm_for_cutout(
         sapm_data,
@@ -2161,6 +2284,8 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
             flux_uJy, err_uJy, area_pix, n_bad = aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius, cfg)
             measurements.append({
                 "wavelength": float(row["central_wavelength_um"]),
+                "bandwidth_um": row.get("bandwidth_um", np.nan),
+                "wavelength_source": row.get("wavelength_source", "WCS-WAVE"),
                 "flux": flux_uJy * 1e-6 if np.isfinite(flux_uJy) else np.nan,
                 "err": err_uJy * 1e-6 if np.isfinite(err_uJy) else np.nan,
                 "flux_uJy": flux_uJy,
@@ -2377,7 +2502,10 @@ def load_spectral_channels_calibration(cfg: PipelineConfig, data_release: str | 
 
     local_candidates = sorted(cache_dir.glob("*.fits")) + sorted(cache_dir.glob("*.fits.gz"))
     if local_candidates and not cfg.redownload_spectral_channels:
-        return read_spectral_channels_file(local_candidates[0])
+        table = read_spectral_channels_file(local_candidates[0])
+        if table is None and release == "qr3":
+            raise ValueError("Cached QR3 spectral-channel file has no channel table.")
+        return table
 
     candidates = []
     rendered = _render_spectral_channels_template(cfg, release)
@@ -2388,20 +2516,17 @@ def load_spectral_channels_calibration(cfg: PipelineConfig, data_release: str | 
 
     for s3_path in candidates:
         local_path = cache_dir / Path(s3_path).name
-        tmp_path = local_path.with_suffix(local_path.suffix + ".part")
         try:
-            with fits.open(f"s3://{s3_path}", fsspec_kwargs={"anon": True}) as hdul:
-                hdul.writeto(tmp_path, overwrite=True)
-            tmp_path.replace(local_path)
-            return read_spectral_channels_file(local_path)
+            download_calibration(s3_path, local_path, cfg.request_timeout_sec)
+            table = read_spectral_channels_file(local_path)
+            if table is None and release == "qr3":
+                raise ValueError("QR3 spectral-channel file has no channel table.")
+            return table
         except Exception as exc:
             logging.warning("Could not load spectral_channels from %s: %s", s3_path, exc)
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
 
+    if release == "qr3":
+        raise RuntimeError("Could not load QR3 spectral-channel calibration.")
     return None
 
 
@@ -2462,18 +2587,18 @@ def spectral_channel_edges_for_detector(table: Table, detector: int):
         return None, None
 
     det_col = _find_column_name(table, ("DETECTOR", "DET", "BAND"))
-    ch_col = _find_column_name(table, ("CHANNEL", "CHAN", "CH", "CHANNEL_ID"))
+    ch_col = _find_column_name(table, ("CHANNEL", "CHAN", "CH", "CHANNEL_ID", "SUBCHAN"))
     center_col = _find_column_name(
         table,
         ("WAVELENGTH", "WAVE", "LAMBDA", "LAMBDA_C", "WAVECEN", "WAVE_CEN", "LAMBDA_CEN", "WAVE_CENTER")
     )
     lo_col = _find_column_name(
         table,
-        ("WAVE_MIN", "LAMBDA_MIN", "WAVEMIN", "LAM_MIN", "WAVE_LO", "LAMBDA_LO", "WAVELENGTH_MIN")
+        ("WAVE_MIN", "LAMBDA_MIN", "WAVEMIN", "LAM_MIN", "WAVE_LO", "LAMBDA_LO", "WAVELENGTH_MIN", "WL_MIN")
     )
     hi_col = _find_column_name(
         table,
-        ("WAVE_MAX", "LAMBDA_MAX", "WAVEMAX", "LAM_MAX", "WAVE_HI", "LAMBDA_HI", "WAVELENGTH_MAX")
+        ("WAVE_MAX", "LAMBDA_MAX", "WAVEMAX", "LAM_MAX", "WAVE_HI", "LAMBDA_HI", "WAVELENGTH_MAX", "WL_MAX")
     )
 
     det_specific_col = _find_column_name(
@@ -2515,8 +2640,19 @@ def spectral_channel_edges_for_detector(table: Table, detector: int):
             return None, None
         order = np.argsort(0.5 * (lo + hi))
         lo, hi = lo[order], hi[order]
-        centers = 0.5 * (lo + hi)
-        edges = np.concatenate([[lo[0]], hi])
+        centers = (np.asarray(rows[center_col], dtype=float)[good][order]
+                   if center_col is not None else 0.5 * (lo + hi))
+        if not np.all(np.isfinite(centers)) or not np.all(np.diff(centers) > 0):
+            raise ValueError("Spectral channel centers must be finite and increasing.")
+        if "WL_MIN" in rows.colnames and "WL_MAX" in rows.colnames:
+            # These are wavelength envelopes of geometrically defined channels;
+            # adjacent envelopes overlap. Partition their common region once.
+            internal = 0.5 * (hi[:-1] + lo[1:])
+            edges = np.concatenate([[lo[0]], internal, [hi[-1]]])
+        else:
+            edges = np.concatenate([[lo[0]], hi])
+        if not np.all(np.diff(edges) > 0):
+            raise ValueError("Spectral channel boundaries must be increasing.")
         return edges, centers
 
     if center_col is not None:
@@ -2682,6 +2818,8 @@ def reduce_oversampling_with_spectral_channels(wl, flux, err, det, channels_tabl
         edges, centers = spectral_channel_edges_for_detector(channels_table, det_num_int)
 
         if edges is None or centers is None or len(edges) < 2:
+            if get_runtime_data_release(cfg, cfg.data_release or "unknown") == "qr3":
+                raise ValueError(f"QR3 spectral-channel calibration missing detector {det_num_int}.")
             fallback_wl.extend(wl_d)
             fallback_flux.extend(flux_d)
             fallback_err.extend(err_d)
@@ -2911,6 +3049,8 @@ def process_spectrum_table(spec: Table, cfg: PipelineConfig, reduce_oversampling
                 )
                 if len(wl2) > 0:
                     wl, flux, err, det = wl2, flux2, err2, det2
+                elif get_runtime_data_release(cfg, cfg.data_release or "unknown") == "qr3":
+                    logging.warning("QR3 spectral-channel binning produced no points; retaining unbinned measurements.")
                 else:
                     logging.warning("spectral_channels binning produced no points; falling back to hard-coded bins.")
                     wl, flux, err, det = reduce_oversampling_per_detector(wl, flux, err, det)
@@ -3088,6 +3228,13 @@ def save_spectrum_fits(
     data_release = get_runtime_data_release(cfg)
     if data_release != "unknown":
         hdu0.header["DATAREL"] = data_release
+    if data_release != "unknown":
+        hdu0.header["SAPMCOLL"] = calibration_collection(cfg, data_release, "sapm")
+    if data_release == "qr3":
+        hdu0.header["SWCSCOLL"] = calibration_collection(cfg, data_release, "spectral_wcs")
+        hdu0.header["WAVESRC"] = "CWAVE"
+    if data_release != "unknown" and cfg.reduce_oversampling and cfg.use_spectral_channels_for_binning:
+        hdu0.header["SCHCOLL"] = calibration_collection(cfg, data_release, "spectral_channels")
     hdu0.header["TARGET"] = f"{ra:.6f},{dec:.6f}"
     hdu0.header["REFRA"] = (float(ra), "Input reference RA [deg]")
     hdu0.header["REFDEC"] = (float(dec), "Input reference Dec [deg]")
@@ -3462,8 +3609,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
     object_name = make_object_name(ra, dec, object_name)
 
     if cfg.query_irsa_for_cutouts:
-        if normalize_data_release(cfg.data_release) == "qr3":
-            raise NotImplementedError("QR3 extraction requires the calibration/aperture and EPSF stages.")
+        require_supported_photometry(normalize_data_release(cfg.data_release), cfg)
         print("Querying SPHEREx cutouts...")
         cutout_table = query_spherex_cutouts(ra, dec, cfg)
         print(f"Found {len(cutout_table)} cutouts")
@@ -3471,8 +3617,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
             {"data_release": infer_data_release_from_uri(str(row["uri"]))}
             for row in cutout_table
         ], cfg.data_release)
-        if query_release == "qr3":
-            raise NotImplementedError("QR3 extraction requires the calibration/aperture and EPSF stages.")
+        require_supported_photometry(query_release, cfg)
         set_runtime_data_release(cfg, query_release)
 
         print("Downloading/caching cutouts...")
@@ -3494,16 +3639,15 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
 
     release = require_single_data_release(prepared_rows, cfg.data_release)
     set_runtime_data_release(cfg, release)
-    if release == "qr3":
-        raise NotImplementedError(
-            "QR3 release and calibration discovery is supported, but QR3 extraction "
-            "requires the calibration/aperture and EPSF stages, which are not implemented yet."
-        )
+    require_supported_photometry(release, cfg)
     cfg.output_dir = str(Path(cfg.output_dir) / release)
     ensure_output_directories(cfg.output_dir)
     print("Opening cached cutouts...")
     cutouts = open_cutouts_parallel(prepared_rows, ra, dec, cfg)
     good_cutouts = [r for r in cutouts if "image_hdu" in r]
+    if release == "qr3" and len(good_cutouts) != len(cutouts):
+        errors = [r.get("open_error", r.get("status", "unknown")) for r in cutouts if "image_hdu" not in r]
+        raise RuntimeError(f"QR3 cutout/calibration preparation failed: {errors}")
     require_single_data_release(good_cutouts, release)
     opened_release = infer_unique_data_release(good_cutouts)
     if opened_release not in ("unknown", "mixed"):

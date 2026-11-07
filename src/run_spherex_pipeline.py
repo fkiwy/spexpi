@@ -130,7 +130,7 @@ psf_local_grid_half_range_pix = 1.0
 outlier_nbr_of_bins = 8
 
 cfg = PipelineConfig(
-    data_release="qr2",  # QR3 extraction is gated until its later stages are implemented.
+    data_release="qr2",  # QR3 is supported with photometry_method="aperture".
 
     # ============================================================
     # 1. PHOTOMETRY MODE & CORE SETTINGS

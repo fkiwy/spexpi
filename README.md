@@ -106,9 +106,43 @@ release batches raise errors rather than falling back to QR2. Supported release
 identifiers are `qr1`, `qr2`, `qr2_deep`, and `qr3` (QR1 archive availability is
 independent of identifier recognition).
 
-**QR3 stage one:** release detection, calibration selection and cache separation
-are implemented. Full QR3 extraction deliberately raises `NotImplementedError`
-until the calibration/aperture and ePSF processing stages are validated.
+**QR3 aperture extraction is supported.** Set `data_release="qr3"` and
+`photometry_method="aperture"`. QR3 `"psf"` and `"both"` modes raise
+`NotImplementedError` until the ePSF processing stage is implemented. QR2 retains
+its existing aperture and PSF processing paths.
+
+QR3 wavelengths and bandwidths are sampled bilinearly from full-resolution
+`CWAVE`/`CBAND` calibration maps (`cal-swcs-v5-2026-191` by default), rather than
+from the approximate image spectral WCS. Both wavelength and pixel-area maps use
+sky detector coordinates: detectors 4–6 are already oriented correctly and are
+not flipped again. Cutout offsets must identify the parent-detector pixels;
+missing or unsupported geometry raises an error. The maps are shared between
+cutout workers and loaded once per detector per run.
+
+```python
+cfg = PipelineConfig(
+    data_release="qr3",
+    photometry_method="aperture",
+    spectral_wcs_cache_dir="../resources/spherex_calibration_files/spectral_wcs",
+    # Leave collection overrides unset to select release-specific calibrations.
+)
+```
+
+The official spectral-channel table's `SUBCHAN`, `WL_MIN`, and `WL_MAX` columns
+are recognized, and its published `WAVELENGTH` centers are retained. Adjacent
+`WL_MIN`/`WL_MAX` envelopes overlap slightly; shared bin boundaries are placed at
+the midpoint between the preceding upper and following lower limits, with the
+outer limits retained. These are wavelength bins, not a replacement for the
+geometrical channel map. This parsing correction also applies to QR2 tables, so
+rebinned results can differ slightly from older runs that inferred edges solely
+from centers. QR3 calibration failures do not silently select legacy bins. If a
+sparse spectrum cannot be integrated into channels, the measured unbinned points
+are retained with a warning.
+
+FITS outputs record `SAPMCOLL`, `SWCSCOLL`, `WAVESRC`, and (when channel binning is
+requested) `SCHCOLL`. Raw measurements also record the sampled bandwidth and
+wavelength source. Aperture fluxes remain finite-aperture measurements; this
+stage adds no aperture-to-total-flux correction.
 
 New cutouts use `download_dir/<release>/<object_name>/`; legacy
 `download_dir/<object_name>/` caches remain readable when their release can be
@@ -955,6 +989,7 @@ Create a compact object name from coordinates.
 
 | Parameter            |                               Default | Description                                                         |
 |----------------------|--------------------------------------:|---------------------------------------------------------------------|
+| `data_release` | `None` | Select a release, or require unambiguous input provenance. |
 | `tap_url`            | `"https://irsa.ipac.caltech.edu/TAP"` | IRSA TAP service URL used to discover SPHEREx image artifacts.      |
 | `cutout_size_arcsec` |                                 `180` | Angular size of the requested IRSA HTTP cutout, in arcseconds.      |
 | `max_workers`        |                                   `8` | Maximum number of worker threads used for download/open operations. |
@@ -995,6 +1030,14 @@ Create a compact object name from coordinates.
 | `sapm_cache_dir`        | `"spherex_calibration_files/spherex_sapm_cache"` | Base directory for cached solid-angle pixel maps, grouped by inferred release. |
 | `redownload_sapm_files` |                                          `False` | If `True`, refresh cached solid-angle pixel maps from S3.                      |
 | `sapm_collection`       |                         `None` | Release-specific SAPM default; string values override it.                    |
+
+### Full-resolution spectral WCS (QR3)
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `spectral_wcs_cache_dir` | `"spherex_calibration_files/spherex_spectral_wcs_cache"` | Full-resolution map cache, grouped by release and collection. |
+| `spectral_wcs_collection` | `None` | QR3 defaults to `cal-swcs-v5-2026-191`; an explicit string overrides it. |
+| `redownload_spectral_wcs` | `False` | Refresh each detector's maps once in the current run. |
 
 ### Photometry mode
 
