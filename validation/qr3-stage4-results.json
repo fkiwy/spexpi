@@ -1,0 +1,368 @@
+{
+  "target": {
+    "name": "SIMP_J013656_validation",
+    "ra": 24.2412498,
+    "dec": 9.5630705,
+    "reference_epoch_yr": 2016.0,
+    "pmra_masyr": 1238.244,
+    "pmdec_masyr": -16.156
+  },
+  "provenance": {
+    "baseline_comparison_requested": true,
+    "pipeline_sha256": "9e6e9a8532ccf7867abfda3e52bfc110d5778ad92ba4b2633c6a34ff6092bce8",
+    "baseline_sha256": "93378612405715fa24b05ba9fae1f2bb8e14152a63f94edbf9b56460699fb2c2"
+  },
+  "cases": [
+    {
+      "release": "qr2",
+      "detector": 1,
+      "uri": "ibe/data/spherex/qr2/level2/2025W28_2A/l2b-v20-2025-260/1/level2_2025W28_2A_0321_1D1_spx_l2b-v20-2025-260.fits",
+      "status": "passed",
+      "sha256": "bb331a7193c5932eb20a86b5e7dd07ae38a4b6509ec04fd083ecd4de6ff449c4",
+      "wavelength_um": 0.7955659469452946,
+      "mjd": 60868.262656328,
+      "aperture": {
+        "flux_uJy": 88.30687843270732,
+        "error_uJy": 93.54765306235898
+      },
+      "psf": {
+        "flux_uJy": 76.42596170702268,
+        "error_uJy": 44.29153746943137,
+        "reduced_chi2": 11.974370139485567
+      },
+      "baseline_max_abs_difference_uJy": 0.0
+    },
+    {
+      "release": "qr2",
+      "detector": 2,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_2B/l2b-v20-2025-262/2/level2_2025W30_2B_0227_3D2_spx_l2b-v20-2025-262.fits",
+      "status": "passed",
+      "sha256": "7dd9b55ba8545731ba25341765b9132a8f41181b45ba8ca5b0b61569ac383d42",
+      "wavelength_um": 1.0949930601034013,
+      "mjd": 60881.715262833,
+      "aperture": {
+        "flux_uJy": 4558.036144647947,
+        "error_uJy": 151.58866779080776
+      },
+      "psf": {
+        "flux_uJy": 2478.149973199367,
+        "error_uJy": 81.1635908346221,
+        "reduced_chi2": 40.877394847228956
+      },
+      "baseline_max_abs_difference_uJy": 0.0
+    },
+    {
+      "release": "qr2",
+      "detector": 3,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_1B/l2b-v20-2025-262/3/level2_2025W30_1B_0212_1D3_spx_l2b-v20-2025-262.fits",
+      "status": "passed",
+      "sha256": "79b39f3693c5f012816da5e78e51f2b8134be059ea67fd7dec307502b7c2e603",
+      "wavelength_um": 1.7663706165010975,
+      "mjd": 60878.181141455,
+      "aperture": {
+        "flux_uJy": 5072.254750683747,
+        "error_uJy": 106.2082300566533
+      },
+      "psf": {
+        "flux_uJy": 2494.8189885700763,
+        "error_uJy": 70.71571214009506,
+        "reduced_chi2": 50.6972342486032
+      },
+      "baseline_max_abs_difference_uJy": 0.0
+    },
+    {
+      "release": "qr2",
+      "detector": 4,
+      "uri": "ibe/data/spherex/qr2/level2/2025W28_2A/l2b-v20-2025-260/4/level2_2025W28_2A_0321_1D4_spx_l2b-v20-2025-260.fits",
+      "status": "passed",
+      "sha256": "cbce251090e08c1dee66eda903483105a48ba44c9e23c8b930a77a100aa7bf55",
+      "wavelength_um": 2.603902878086601,
+      "mjd": 60868.262656328,
+      "aperture": {
+        "flux_uJy": 3027.025868603365,
+        "error_uJy": 72.29701043195924
+      },
+      "psf": {
+        "flux_uJy": 1811.0425198003313,
+        "error_uJy": 56.19012657103799,
+        "reduced_chi2": 24.182577067034135
+      },
+      "baseline_max_abs_difference_uJy": 0.0
+    },
+    {
+      "release": "qr2",
+      "detector": 5,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_2B/l2b-v20-2025-262/5/level2_2025W30_2B_0227_3D5_spx_l2b-v20-2025-262.fits",
+      "status": "passed",
+      "sha256": "e322f93eccc1066b83e142b89dea41cc0e085db52021d78b00e517d08902ed2f",
+      "wavelength_um": 3.8069248013920003,
+      "mjd": 60881.715262844,
+      "aperture": {
+        "flux_uJy": 12907.588129162148,
+        "error_uJy": 228.03697635452778
+      },
+      "psf": {
+        "flux_uJy": 5614.713014501421,
+        "error_uJy": 155.85189429413566,
+        "reduced_chi2": 33.84368000212361
+      },
+      "baseline_max_abs_difference_uJy": 0.0
+    },
+    {
+      "release": "qr2",
+      "detector": 6,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_2B/l2b-v20-2025-262/6/level2_2025W30_2B_0239_4D6_spx_l2b-v20-2025-262.fits",
+      "status": "passed",
+      "sha256": "6602c7e57109279371fc5a03a66172c60e63cf1ae9be0e2384f3f7a1b8668c03",
+      "wavelength_um": 4.458479325344838,
+      "mjd": 60881.783959847,
+      "aperture": {
+        "flux_uJy": 6006.639753837728,
+        "error_uJy": 245.49503344808122
+      },
+      "psf": {
+        "flux_uJy": 3585.370397128262,
+        "error_uJy": 176.07740002151564,
+        "reduced_chi2": 8.024615793424303
+      },
+      "baseline_max_abs_difference_uJy": 0.0
+    },
+    {
+      "release": "qr3",
+      "detector": 1,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/1/level2_2026W30_1B_0244_1D1_spx_l2b-v27-2026-222.fits",
+      "status": "passed",
+      "sha256": "4196a179f206a16a6654d1ddf06bc56da80a40d01e35004823eb6e0e4f65943b",
+      "wavelength_um": 1.067657709121704,
+      "mjd": 61242.333024638,
+      "aperture": {
+        "flux_uJy": 5152.221125441012,
+        "error_uJy": 147.16122457996929
+      },
+      "psf": {
+        "flux_uJy": 4909.442585984548,
+        "error_uJy": 94.76694142994026,
+        "reduced_chi2": 7.687058737948289
+      },
+      "reference": {
+        "flux_uJy": 4909.442433956527,
+        "error_uJy": 94.76694142994026,
+        "binx": 18,
+        "biny": 2,
+        "grid": [
+          21,
+          21
+        ]
+      }
+    },
+    {
+      "release": "qr3",
+      "detector": 2,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/2/level2_2026W30_1B_0050_1D2_spx_l2b-v27-2026-222.fits",
+      "status": "passed",
+      "sha256": "212d79bcad797e3a141c4fe636b3098d85f04f95de6fb9287e403b0f9c1d1eb7",
+      "wavelength_um": 1.307617425918579,
+      "mjd": 61241.246680703,
+      "aperture": {
+        "flux_uJy": 9148.167356152768,
+        "error_uJy": 122.86497423689296
+      },
+      "psf": {
+        "flux_uJy": 9365.781620182435,
+        "error_uJy": 111.60510675288022,
+        "reduced_chi2": 13.607340548221242
+      },
+      "reference": {
+        "flux_uJy": 9365.781479470497,
+        "error_uJy": 111.60510675288022,
+        "binx": 15,
+        "biny": 11,
+        "grid": [
+          21,
+          21
+        ]
+      }
+    },
+    {
+      "release": "qr3",
+      "detector": 3,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/3/level2_2026W30_1B_0022_1D3_spx_l2b-v27-2026-222.fits",
+      "status": "passed",
+      "sha256": "f514842cec924c8ec49186a474020bcae8c57e18454d991f0d39f0a874f75ce6",
+      "wavelength_um": 1.7889013290405273,
+      "mjd": 61241.11152502,
+      "aperture": {
+        "flux_uJy": 4296.11152434795,
+        "error_uJy": 99.78971990523894
+      },
+      "psf": {
+        "flux_uJy": 4203.378099922318,
+        "error_uJy": 80.47645438982649,
+        "reduced_chi2": 5.182838877287039
+      },
+      "reference": {
+        "flux_uJy": 4203.378035772664,
+        "error_uJy": 80.47645438982647,
+        "binx": 6,
+        "biny": 30,
+        "grid": [
+          11,
+          41
+        ]
+      }
+    },
+    {
+      "release": "qr3",
+      "detector": 4,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/4/level2_2026W30_1B_0244_1D4_spx_l2b-v27-2026-222.fits",
+      "status": "passed",
+      "sha256": "692e8887188090561f705a2d4faf5ec8fe3c3b1133e4927fb57f9193536685ec",
+      "wavelength_um": 3.647406816482544,
+      "mjd": 61242.333024638,
+      "aperture": {
+        "flux_uJy": 8212.919498244542,
+        "error_uJy": 94.22060307565647
+      },
+      "psf": {
+        "flux_uJy": 8637.386881848292,
+        "error_uJy": 95.26633668352194,
+        "reduced_chi2": 3.0559448247572596
+      },
+      "reference": {
+        "flux_uJy": 8637.386920335637,
+        "error_uJy": 95.266336683522,
+        "binx": 18,
+        "biny": 2,
+        "grid": [
+          21,
+          21
+        ]
+      }
+    },
+    {
+      "release": "qr3",
+      "detector": 5,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/5/level2_2026W30_1B_0050_1D5_spx_l2b-v27-2026-222.fits",
+      "status": "passed",
+      "sha256": "6b0e388f837cda41c71d3f77959748e148acbcd9c3837f6436fddee8fba2037e",
+      "wavelength_um": 4.071296691894531,
+      "mjd": 61241.246680703,
+      "aperture": {
+        "flux_uJy": 14005.459524284568,
+        "error_uJy": 245.17912994711966
+      },
+      "psf": {
+        "flux_uJy": 14881.598998976919,
+        "error_uJy": 245.01235834727603,
+        "reduced_chi2": 1.3403415639210523
+      },
+      "reference": {
+        "flux_uJy": 14881.598634894674,
+        "error_uJy": 245.0123583472761,
+        "binx": 15,
+        "biny": 11,
+        "grid": [
+          21,
+          21
+        ]
+      }
+    },
+    {
+      "release": "qr3",
+      "detector": 6,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/6/level2_2026W30_1B_0022_1D6_spx_l2b-v27-2026-222.fits",
+      "status": "passed",
+      "sha256": "10e15aca28f4a93939204edea747d516b97a28b9b95d5fe342a734b19b001fef",
+      "wavelength_um": 4.5472612380981445,
+      "mjd": 61241.111525032,
+      "aperture": {
+        "flux_uJy": 3227.7542103911455,
+        "error_uJy": 240.42470531572405
+      },
+      "psf": {
+        "flux_uJy": 3666.580400429977,
+        "error_uJy": 177.13329234821782,
+        "reduced_chi2": 1.0606628477072275
+      },
+      "reference": {
+        "flux_uJy": 3666.5803170193262,
+        "error_uJy": 177.1332923482177,
+        "binx": 12,
+        "biny": 15,
+        "grid": [
+          21,
+          21
+        ]
+      }
+    }
+  ],
+  "products": [
+    {
+      "release": "qr2",
+      "method": "aperture",
+      "points": 6,
+      "status": "passed"
+    },
+    {
+      "release": "qr2",
+      "method": "psf",
+      "points": 6,
+      "status": "passed"
+    },
+    {
+      "release": "qr3",
+      "method": "aperture",
+      "points": 6,
+      "status": "passed"
+    },
+    {
+      "release": "qr3",
+      "method": "psf",
+      "points": 6,
+      "status": "passed"
+    }
+  ],
+  "validation_date": "2026-11-07",
+  "baseline_git_revision": "96b9ff95b4497f18b7cfc75dc6b38bcb3aff1b0f",
+  "pipeline_git_revision": "585f121e4568f13babb72b98b71a3c046f46ad73",
+  "irsa_service_comparison": {
+    "status": "unavailable",
+    "phase": "ERROR",
+    "request": {
+      "POINT": "24.244929417,9.563023138",
+      "TIME": "61241.1108,61241.1123",
+      "DETECTOR": "D3"
+    },
+    "error": "Internal error; contact IRSA user support (Unexpected failure during VOTable file creation or modification: )",
+    "photometry_returned": false,
+    "note": "The independent ImagePSF/SVD check is not a comparison with the remote Tractor service."
+  },
+  "runtime": {
+    "python": "3.12.14",
+    "numpy": "2.5.4",
+    "astropy": "8.0.2",
+    "scipy": "1.18.1",
+    "photutils": "3.1.1"
+  },
+  "numerical_tolerances": {
+    "reference_relative": 1e-06,
+    "reference_absolute_uJy": 1e-06,
+    "qr2_baseline_absolute_uJy": 1e-08
+  },
+  "images": [
+    {
+      "release": "qr2",
+      "status": "passed",
+      "detectors": 6,
+      "finite_data": true,
+      "plot_written": true
+    },
+    {
+      "release": "qr3",
+      "status": "passed",
+      "detectors": 6,
+      "finite_data": true,
+      "plot_written": true
+    }
+  ]
+}

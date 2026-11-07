@@ -189,6 +189,9 @@ checked against the [public archive](https://nasa-irsa-spherex.s3.amazonaws.com/
 See the [IRSA release documentation](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/overview_qr.html)
 for the distinction between QR3 observations and DR1 reprocessing.
 
+For the reproducible cross-release validation results, scientific limits, and
+archive-service comparison status, see [stage-four validation](validation/QR3_STAGE4.md).
+
 Run the release regression tests with:
 
 ```bash
