@@ -33,6 +33,7 @@ FITS spectra and diagnostic plots.
 - [Outputs](#outputs)
 - [Complete API documentation](#complete-api-documentation)
 - [Configuration reference](#configuration-reference)
+- [Migrating an existing QR2 workflow](#migrating-an-existing-qr2-workflow)
 - [Recommended workflow](#recommended-workflow)
 - [Troubleshooting](#troubleshooting)
 - [Acknowledgements](#acknowledgements)
@@ -86,7 +87,8 @@ The pipeline supports two input modes:
 
 - `query_irsa_for_cutouts=True`: query IRSA TAP, download or extract cutouts, and cache them locally.
 - `query_irsa_for_cutouts=False`: skip the IRSA query and read already cached FITS files from
-  `download_dir/<object_name>/`.
+  `download_dir/<release>/<object_name>/` (legacy object-only caches remain readable
+  when their release is known).
 
 Downloads can use:
 
@@ -219,8 +221,11 @@ The pipeline can measure multiple aperture radii for diagnostics but builds the 
 
 ### 6. PSF photometry
 
-PSF photometry extracts a SPHEREx PSF kernel from the calibration information contained in the cutout file. The PSF is
-shifted to the subpixel source position and fitted with a weighted linear model.
+PSF photometry uses the QR2 optical `PSF` cube or the QR3 `EPSF` table in the cutout.
+QR3 models are evaluated at native pixel centers for the source's subpixel
+position; QR2 retains its optical-kernel shift/rebin path. A weighted linear fit
+solves for flux and background. See [data release handling](#3-data-release-handling)
+for normalization, uncertainty and isolated-source limitations.
 
 Optional local grid search can refine the centroid around the WCS-predicted position. This is controlled by:
 
@@ -338,6 +343,21 @@ pmDec =  -16.156 mas/yr
 reference epoch = 2016.0
 ```
 
+Run the top-level examples from `src/` after installing the package:
+
+```bash
+cd src
+python run_spherex_pipeline.py  # QR3 download/extraction; may retrieve many exposures
+python plot_images.py           # requires the QR3 cache from extraction
+python compare_spectra.py       # offline demo using bundled QR2 spectra/templates
+python plot_sequence.py         # offline plot of the bundled QR2 standards
+```
+
+New products are written under the ignored `outputs/` directory, with release
+subdirectories. Bundled QR2 FITS spectra and plots remain in `resources/`.
+The raw exposure cutouts are not bundled; setting `query_irsa_for_cutouts=False`
+requires an existing cache for the selected release.
+
 ### a) Run the SPHEREx pipeline
 
 This example is based on `run_spherex_pipeline.py`.
@@ -356,7 +376,7 @@ pmra, pmdec = 1238.244, -16.156
 ref_epoch = 2016.0
 
 cfg = PipelineConfig(
-    data_release="qr2",
+    data_release="qr3",
     # Photometry mode: "aperture", "psf", or "both".
     # "both" writes independent aperture and PSF spectra/plots in one run.
     photometry_method="both",
@@ -399,13 +419,15 @@ cfg = PipelineConfig(
     sapm_cache_dir="../resources/spherex_calibration_files/spherex_sapm_cache",
     redownload_sapm_files=False,
     sapm_collection=None,
+    spectral_wcs_cache_dir="../resources/spherex_calibration_files/spherex_spectral_wcs_cache",
+    spectral_wcs_collection=None,
     spectral_channels_cache_dir="../resources/spherex_calibration_files/spherex_spectral_channels_cache",
     redownload_spectral_channels=False,
 
     # Outputs
-    output_dir="../resources/objects/spectra",
-    save_raw_measurements=False,
-    save_manifest=False,
+    output_dir="../outputs/spectra",
+    save_raw_measurements=True,
+    save_manifest=True,
 
     # Proper motion propagation
     reference_epoch_yr=ref_epoch,
@@ -432,17 +454,17 @@ spectra, measurements = run_spherex_pipeline(
 Expected products include:
 
 ```text
-../resources/objects/spectra/qr2/fits/T2 SIMP J013656.5+093347.3_aperture_spectrum.fits
-../resources/objects/spectra/qr2/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits
-../resources/objects/spectra/qr2/plots/T2 SIMP J013656.5+093347.3_aperture_spectrum.pdf
-../resources/objects/spectra/qr2/plots/T2 SIMP J013656.5+093347.3_psf_spectrum.pdf
+../outputs/spectra/qr3/fits/T2 SIMP J013656.5+093347.3_aperture_spectrum.fits
+../outputs/spectra/qr3/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits
+../outputs/spectra/qr3/plots/T2 SIMP J013656.5+093347.3_aperture_spectrum.pdf
+../outputs/spectra/qr3/plots/T2 SIMP J013656.5+093347.3_psf_spectrum.pdf
 ```
 
 When `photometry_method="aperture"` or `photometry_method="psf"`, the first return value is a single
 `astropy.table.Table`. When `photometry_method="both"`, the first return value is a dictionary with keys such as
 `"aperture"` and `"psf"`.
 
-Spectrum diagnostic plots:
+Bundled QR2 diagnostic plots (illustrations, not outputs from the QR3 example):
 
 a) Aperture photometry:
 
@@ -456,6 +478,11 @@ b) PSF photometry:
 
 This example is based on `compare_spectra.py`. It loads a set of template FITS spectra, creates `Spectrum` objects,
 compares an observed spectrum to templates using reduced chi-square, and plots the best matches.
+This offline demo deliberately uses the bundled QR2 target and QR2 SPHEREx
+standard library. Do not substitute a QR3 target while retaining these templates.
+`src/compare_spectra.py` checks `DATAREL` on both inputs and rejects a mismatch.
+For QR3 comparison, regenerate the SPHEREx standards on the same release and
+photometry method, then change both input locations and the selected release.
 
 ```python
 import os
@@ -468,8 +495,11 @@ from spexpi.spectrum_comparator import Spectrum, SpectrumTemplateComparator
 from spexpi.spectrum_plotter import create_comparison_plot
 
 
-def extract_spectrum_from_fits(fits_file_path):
+def extract_spectrum_from_fits(fits_file_path, expected_release):
     with fits.open(fits_file_path) as hdul:
+        actual_release = str(hdul[0].header.get("DATAREL", "unknown")).lower()
+        if actual_release != expected_release:
+            raise ValueError(f"Expected {expected_release}, found {actual_release}")
         data = hdul[1].data
         wavelength = data["WAVELENGTH"]
         flux = data["FLUX"]
@@ -479,6 +509,7 @@ def extract_spectrum_from_fits(fits_file_path):
 
 warnings.simplefilter("ignore", category=Warning)
 
+data_release = "qr2"  # Bundled target and SPHEREx standard library
 wl_unit = u.um
 flux_unit = u.Jy
 
@@ -488,7 +519,7 @@ templates = []
 
 for filename in sorted(f for f in os.listdir(standards_dir) if f.endswith(".fits")):
     full_path = os.path.join(standards_dir, filename)
-    wavelength, flux, flux_error = extract_spectrum_from_fits(full_path)
+    wavelength, flux, flux_error = extract_spectrum_from_fits(full_path, data_release)
 
     spt = filename.split()[0].replace("_", "")
 
@@ -505,7 +536,7 @@ for filename in sorted(f for f in os.listdir(standards_dir) if f.endswith(".fits
 object_name = "T2 SIMP J013656.5+093347.3"
 fits_path = "../resources/objects/spectra/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits"
 
-wavelength, flux, flux_error = extract_spectrum_from_fits(fits_path)
+wavelength, flux, flux_error = extract_spectrum_from_fits(fits_path, data_release)
 
 observed = Spectrum(
     label=object_name,
@@ -533,10 +564,11 @@ print("Statistic:", result.best_match.statistic)
 create_comparison_plot(
     result,
     object_name=object_name,
-    output_dir="../resources/objects/spectra/plots",
+    output_dir=f"../outputs/comparisons/{data_release}",
     plot_format="pdf",
     plot_observed_error=True,
     plot_template_error=False,
+    open_plot=False,
 )
 ```
 
@@ -550,7 +582,7 @@ Supported scaling modes include:
 - `least-squares`
 - `scale-shift`
 
-Comparison plot:
+Bundled QR2 comparison plot:
 
 <img src="resources/objects/spectra/plots/T2 SIMP J013656.5+093347.3_comparison.png" alt="Alt Text" style="width:70%; height:auto;">
 
@@ -572,6 +604,7 @@ import warnings
 
 from spexpi.image_plotter import plot_images
 from spexpi.image_stacker import stack_images
+from spexpi.spherex_pipeline import PipelineConfig, get_object_download_dir
 
 warnings.filterwarnings("ignore")
 
@@ -580,8 +613,10 @@ ra, dec = 24.2455, 9.5625
 object_name = "T2 SIMP J013656.5+093347.3"
 
 image_size_arcsec = 100
-data_dir = "../resources/objects/data/" + object_name.replace(" ", "_")
-output_dir = "../resources/objects/images_v2"
+data_release = "qr3"
+cfg = PipelineConfig(data_release=data_release, download_dir="../resources/objects/data")
+data_dir = str(get_object_download_dir(cfg, object_name))
+output_dir = f"../outputs/images/{data_release}"
 
 images = stack_images(
     ra,
@@ -602,7 +637,7 @@ plot_images(
     image_contrast=10,
     object_name=object_name,
     output_dir=output_dir,
-    open_plot=True,
+    open_plot=False,
     plot_format="pdf",
 )
 ```
@@ -610,7 +645,7 @@ plot_images(
 The image workflow is useful for checking whether the target is centered, whether nearby sources contaminate the
 aperture, and whether a detector-specific issue is present.
 
-Images plot:
+Bundled QR2 images (illustration):
 
 <img src="resources/objects/images/plots/T2 SIMP J013656.5+093347.3_images.png" alt="Images" style="width:100%; height:auto;">
 
@@ -620,7 +655,9 @@ Images plot:
 
 ### Spectrum FITS files
 
-The pipeline writes one FITS spectrum per selected method:
+`PipelineConfig.output_dir` is a base directory. Extraction adds the selected
+release, writing spectra to `<output_dir>/<release>/fits/` and plots to
+`<output_dir>/<release>/plots/`. The pipeline writes one FITS spectrum per method:
 
 ```text
 <object_name>_aperture_spectrum.fits
@@ -644,7 +681,7 @@ statistics when available.
 Plots are saved to:
 
 ```text
-<output_dir>/plots/
+<output_dir>/<release>/plots/
 ```
 
 The plotting unit is controlled by `plot_flux_lambda`:
@@ -657,7 +694,7 @@ The plotting unit is controlled by `plot_flux_lambda`:
 If `save_raw_measurements=True`, the pipeline writes all per-cutout photometry measurements to:
 
 ```text
-<output_dir>/fits/<object_name>_measurements.fits
+<output_dir>/<release>/fits/<object_name>_measurements.fits
 ```
 
 ### Manifests
@@ -713,7 +750,8 @@ local file paths, download status, and inferred data release.
 
 #### `prepare_cached_cutout_rows(object_name, cfg)`
 
-Build row dictionaries from already cached FITS files in `download_dir/<object_name>/`.
+Build row dictionaries from `download_dir/<release>/<object_name>/`, with legacy
+object-only cache support when provenance can be established.
 
 #### `open_cutouts_parallel(prepared_rows, ra, dec, cfg)`
 
@@ -723,8 +761,8 @@ return cutout dictionaries.
 #### `process_cutout_row(row, ra, dec, cfg)`
 
 Open one FITS cutout and build the in-memory representation needed for photometry. This includes `IMAGE`, `FLAGS`,
-`VARIANCE`, optional `ZODI`, optional `PSF`, detector number, wavelength, projected source position, and release
-metadata.
+`VARIANCE`, optional `ZODI`, QR2 `PSF` or QR3 `EPSF`, detector number, calibrated
+wavelength, projected source position, and release metadata.
 
 #### `measure_cutout_photometry(row, sapm_cache, cfg)`
 
@@ -781,6 +819,15 @@ Write the inferred `DATAREL` keyword into all FITS HDUs where possible.
 #### `load_sapm(detector, cfg, data_release)`
 
 Load and cache the solid-angle pixel map for a detector and data release.
+
+#### `load_spectral_wcs(detector, cfg, data_release)`
+
+Load and cache full-resolution QR3 `CWAVE`/`CBAND` maps in sky detector coordinates.
+
+#### `select_epsf_zone(hdul, x, y)`, `extract_spherex_epsf_kernel(hdul, x, y, cfg)`
+
+Select a QR3 zone using parent-detector coordinates and render the ePSF at native
+pixel centers. Full-model normalization is retained when the fitting window is clipped.
 
 #### `load_spectral_channels_calibration(cfg, data_release=None)`
 
@@ -932,7 +979,8 @@ Parameters:
 - `background_inner_radius_pix`: inner annulus radius for overlay diagnostics.
 - `background_outer_radius_pix`: outer annulus radius for overlay diagnostics.
 - `fatal_flag_bits`: bit flags excluded from stacking.
-- `include_reference_image`: include a reference image in output list.
+- `include_reference_image`: include the first exposure in the mean stack. Keep `True`
+  (the default) when only one exposure is available per detector; `False` excludes it.
 - `overwrite`: overwrite stacked FITS files.
 - `verbose`: print progress.
 
@@ -954,8 +1002,8 @@ plot_images(
     image_size=100,
     image_contrast=10,
     object_name="T2 SIMP J013656.5+093347.3",
-    output_dir="../resources/objects/images_v2",
-    open_plot=True,
+    output_dir="../outputs/images/qr3",
+    open_plot=False,
     plot_format="pdf",
 )
 ```
@@ -1091,8 +1139,8 @@ Create a compact object name from coordinates.
 
 | Parameter                           |              Default | Description                                                                          |
 |-------------------------------------|---------------------:|--------------------------------------------------------------------------------------|
-| `psf_kernel_radius_native`          |                  `5` | Half-size of the rebinned native-pixel PSF kernel.                                   |
-| `psf_shift_sign`                    |                `1.0` | Sign convention applied to the subpixel PSF shift.                                   |
+| `psf_kernel_radius_native`          |                  `5` | Half-size of the native PSF fitting window; QR3 evaluates its ePSF directly.                                   |
+| `psf_shift_sign`                    |                `1.0` | QR2 optical-PSF shift sign; unused for QR3 native-coordinate evaluation.                                   |
 | `psf_fit_background_gradient`       |              `False` | If `True`, include linear x/y background-gradient terms in the PSF fit.              |
 | `psf_min_valid_pixels`              |                  `6` | Minimum number of unmasked pixels required for a valid PSF fit.                      |
 | `psf_max_reduced_chi2`              |               `None` | Optional maximum reduced chi-square above which PSF measurements are rejected.       |
@@ -1133,7 +1181,7 @@ Create a compact object name from coordinates.
 
 | Parameter                                  |              Default | Description                                                                                                                       |
 |--------------------------------------------|---------------------:|-----------------------------------------------------------------------------------------------------------------------------------|
-| `output_dir`                               |  `"spherex_spectra"` | Base output directory for spectra, plots, and optional manifests.                                                                 |
+| `output_dir`                               |  `"spherex_spectra"` | Base output directory; extraction adds `<release>/fits` and `<release>/plots`.                                                                 |
 | `save_raw_measurements`                    |              `False` | If `True`, write the per-cutout measurement table to FITS.                                                                        |
 | `save_manifest`                            |              `False` | If `True`, write CSV/JSONL processing manifests for cutouts and measurements.                                                     |
 | `manifest_format`                          |             `"both"` | Manifest output format: `'csv'`, `'jsonl'`, or `'both'`.                                                                          |
@@ -1157,6 +1205,32 @@ Create a compact object name from coordinates.
 | `vertical_line_position`                   |                `0.0` | Position of the vertical line in microns.                                                                                         |
 
 ---
+
+## Migrating an existing QR2 workflow
+
+1. Keep the existing QR2 raw cache, spectra and standards. QR3 covers later
+   survey observations; it is not a complete reprocessing of QR2 epochs. DR1
+   reprocessing is distinct and is not implicitly supported by selecting QR3.
+2. Set `data_release="qr3"`; choose aperture, PSF, or both. Leave collection
+   overrides unset so each calibration comes from its release-specific default.
+   Set `query_irsa_for_cutouts=False` only after populating the QR3 cache.
+3. Write new products to a separate base directory such as `outputs/spectra`.
+   Extraction appends `qr3`; do not append the release twice. Image-stack and
+   comparator functions take literal output directories, so include the release
+   explicitly when calling those helpers.
+4. Re-extract each SPHEREx standard using its own position, proper motion and
+   reference epoch, with the same release and photometry method as the target.
+   Collect only the relevant spectrum FITS files in a dedicated QR3 template
+   directory. The bundled library remains QR2; no QR3 replacement library is shipped.
+5. In `compare_spectra.py`, set `data_release="qr3"`, set `fits_path` to
+   `../outputs/spectra/qr3/fits/<target>_psf_spectrum.fits`, and set `data_dir` to
+   the newly assembled QR3 PSF template directory. Inspect fit residuals, masks
+   and quality statistics before interpreting matches.
+
+Do not concatenate QR2 and QR3 measurements without an explicit calibration
+reconciliation. Archive gain-correction products do not reproduce all R7
+processing improvements. See [stage-four validation](validation/QR3_STAGE4.md)
+for what has been checked and for the unavailable remote IRSA comparison.
 
 ## Recommended workflow
 
@@ -1191,13 +1265,12 @@ returns the requested region.
 
 ### Data release cannot be inferred
 
-Recent versions of the pipeline stamp `DATAREL` into downloaded FITS headers. If older cached files lack this keyword
-and their paths do not include a release name, redownload the cutouts or move them under a directory that includes the
-release name, such as:
-
-```text
-data/qr2/<object_name>/
-```
+Recover the original archive URI or other trustworthy provenance first. For a
+known release, restore its cache location or `DATAREL` metadata on a copy.
+`data_release="qr3"` selects/filter inputs; it does not override unknown or
+conflicting file provenance. Never relabel QR2 data as QR3 or rename unknown
+files into a release directory just to bypass the error. If provenance cannot
+be recovered, download the correct release again.
 
 ### PSF spectrum is noisy
 

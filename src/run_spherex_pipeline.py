@@ -1,3 +1,8 @@
+"""QR3 extraction example. Run from src/ after installing spexpi.
+
+Downloads can be substantial. Set query_irsa_for_cutouts=False to reuse an
+existing release-specific cache. Generated spectra go under ../outputs/.
+"""
 from astropy.time import Time
 
 from spexpi.spherex_pipeline import PipelineConfig, run_spherex_pipeline
@@ -130,12 +135,12 @@ psf_local_grid_half_range_pix = 1.0
 outlier_nbr_of_bins = 8
 
 cfg = PipelineConfig(
-    data_release="qr2",  # Select "qr3" for aperture and/or embedded-EPSF photometry.
+    data_release="qr3",  # Use "qr2" to re-extract earlier-release images separately.
 
     # ============================================================
     # 1. PHOTOMETRY MODE & CORE SETTINGS
     # ============================================================
-    photometry_method="aperture",  # "aperture", "psf", or "both"
+    photometry_method="both",  # QR3 aperture and embedded-ePSF spectra
 
     # --- Aperture photometry ---
     selected_aperture_radius_pix=selected_aperture_radius_pix,  # main radius used for final spectrum
@@ -143,7 +148,7 @@ cfg = PipelineConfig(
 
     # --- PSF photometry ---
     psf_kernel_radius_native=5,  # PSF kernel half-size (native pixels)
-    psf_shift_sign=1.0,  # sign convention for subpixel shift
+    psf_shift_sign=1.0,  # QR2 optical PSF only; QR3 evaluates native pixel coordinates
     psf_fit_background_gradient=False,  # fit background gradient
 
     # ============================================================
@@ -158,7 +163,7 @@ cfg = PipelineConfig(
     psf_local_grid_step_pix=0.25,  # fine grid; use 0.5 if half_range > 1.0
 
     # Optimization metric
-    psf_local_grid_metric="snr",  # "snr" (robust) or "chi2" (more sensitive)
+    psf_local_grid_metric="snr",  # highest signed S/N; "chi2" minimizes fit residuals
 
     # Apply to all detectors
     psf_grid_search_enabled_detectors=(1, 2, 3, 4, 5, 6),
@@ -177,7 +182,7 @@ cfg = PipelineConfig(
     # ============================================================
     reduce_oversampling=True,  # bin repeated SPHEREx measurements to reduce spectral oversampling
 
-    use_spectral_channels_for_binning=True,  # use QR2 calibration (preferred over hard-coded bands)
+    use_spectral_channels_for_binning=True,  # select calibration for the chosen release
     spectral_channels_min_points_per_bin=1,
     spectral_channels_bin_by="integrate",  # best choice for flux-conserving spectra, alternatives: "edges" or "nearest"
 
@@ -206,12 +211,16 @@ cfg = PipelineConfig(
     sapm_cache_dir="../resources/spherex_calibration_files/spherex_sapm_cache",
     redownload_sapm_files=False,
     sapm_collection=None,
+    spectral_wcs_cache_dir="../resources/spherex_calibration_files/spherex_spectral_wcs_cache",
+    spectral_wcs_collection=None,  # QR3 full-resolution CWAVE/CBAND maps
 
     # ============================================================
     # 7. OUTPUT & VISUALIZATION
     # ============================================================
-    output_dir="../resources/objects/spectra",
+    output_dir="../outputs/spectra",
     plot_spectrum=True,
+    save_raw_measurements=True,  # retain fit quality, ePSF zone and calibration provenance
+    save_manifest=True,
 
     # ============================================================
     # 8. OPTIONAL: PROPER MOTION / EPOCH PROPAGATION

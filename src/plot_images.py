@@ -1,7 +1,13 @@
+"""Stack one release's cached cutouts. Run from src/ after extraction.
+
+The raw exposure cache is not bundled. Set data_release to match the extraction;
+outputs go to a separate release directory under ../outputs/images/.
+"""
 import warnings
 
 from spexpi.image_plotter import plot_images
 from spexpi.image_stacker import stack_images
+from spexpi.spherex_pipeline import PipelineConfig, get_object_download_dir
 
 warnings.filterwarnings("ignore")
 
@@ -86,8 +92,10 @@ ra, dec = 24.2455, 9.5625
 object_name = "T2 SIMP J013656.5+093347.3"
 
 image_size_arcsec = 100
-data_dir = "../resources/objects/data/" + object_name.replace(" ", "_")
-output_dir = "../resources/objects/images"
+data_release = "qr3"
+cfg = PipelineConfig(data_release=data_release, download_dir="../resources/objects/data")
+data_dir = str(get_object_download_dir(cfg, object_name))
+output_dir = f"../outputs/images/{data_release}"
 
 images = stack_images(ra, dec, data_dir, output_dir, object_name, image_size_arcsec, save_fits=True, verbose=False)
 
@@ -99,6 +107,6 @@ plot_images(
     image_contrast=10,
     object_name=object_name,
     output_dir=output_dir,
-    open_plot=True,
+    open_plot=False,
     plot_format="pdf",
 )

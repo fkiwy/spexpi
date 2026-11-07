@@ -2,3 +2,6 @@ resources/objects/data
 resources/standards/data
 test
 .idea
+
+# Generated example products; bundled resources stay versioned.
+/outputs/
