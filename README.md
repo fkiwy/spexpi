@@ -106,10 +106,10 @@ release batches raise errors rather than falling back to QR2. Supported release
 identifiers are `qr1`, `qr2`, `qr2_deep`, and `qr3` (QR1 archive availability is
 independent of identifier recognition).
 
-**QR3 aperture extraction is supported.** Set `data_release="qr3"` and
-`photometry_method="aperture"`. QR3 `"psf"` and `"both"` modes raise
-`NotImplementedError` until the ePSF processing stage is implemented. QR2 retains
-its existing aperture and PSF processing paths.
+**QR3 aperture and ePSF extraction are supported.** Set `data_release="qr3"`
+and choose `photometry_method="aperture"`, `"psf"`, or `"both"`. QR3 PSF fitting
+uses the embedded `EPSF` binary table; QR2 retains its optical `PSF` cube path.
+The `"both"` mode writes independent aperture and PSF spectra.
 
 QR3 wavelengths and bandwidths are sampled bilinearly from full-resolution
 `CWAVE`/`CBAND` calibration maps (`cal-swcs-v5-2026-191` by default), rather than
@@ -122,7 +122,7 @@ cutout workers and loaded once per detector per run.
 ```python
 cfg = PipelineConfig(
     data_release="qr3",
-    photometry_method="aperture",
+    photometry_method="both",
     spectral_wcs_cache_dir="../resources/spherex_calibration_files/spectral_wcs",
     # Leave collection overrides unset to select release-specific calibrations.
 )
@@ -139,8 +139,34 @@ from centers. QR3 calibration failures do not silently select legacy bins. If a
 sparse spectrum cannot be integrated into channels, the measured unbinned points
 are retained with a warning.
 
+QR3 ePSF fitting follows [IRSA's native-pixel rendering recipe](https://github.com/Caltech-IPAC/irsa-tutorials/blob/main/tutorials/spherex/spherex_psf.md).
+It selects the nearest zone center using parent-detector `XCENTER`/`YCENTER`,
+checks zone coverage, and reads `OVSMPX`/`OVSMPY`. It supports rectangular grids
+(including detector 3's 11 × 41 zones) and arbitrary table row ordering. Both the
+image and model must use sky detector coordinates.
+
+The ePSF is evaluated with Photutils `ImagePSF` at native pixel centers for each
+trial centroid. It is normalized over its full native support before restricting
+the fitting window or masking/clipping pixels; it is not block-summed or
+renormalized to the surviving pixels. This yields flux in the finite calibrated
+model's normalization, without extrapolating unmeasured PSF wings. The fit solves
+for flux and constant background, optionally including a background gradient.
+Existing grid-search controls and `psf_max_reduced_chi2` remain available.
+`psf_shift_sign` applies to the QR2 optical model only; QR3 uses physical pixel
+coordinates directly. Missing or malformed QR3 models raise errors rather than
+falling back to optical-PSF processing.
+
+PSF errors are formal covariance errors at the chosen centroid. They do not
+include centroid uncertainty, an aperture correction, or the archive's additional
+systematic uncertainty floor. This remains an isolated-source fitter, without
+Tractor's simultaneous modelling of neighbouring sources. Inspect reduced chi-square
+and masks before interpreting scientific differences from archive photometry.
+
 FITS outputs record `SAPMCOLL`, `SWCSCOLL`, `WAVESRC`, and (when channel binning is
-requested) `SCHCOLL`. Raw measurements also record the sampled bandwidth and
+requested) `SCHCOLL`. QR3 PSF spectra also record `PSFMODEL=EPSF`, `PSFNORM=FULL`,
+`ERRTYPE=FORMAL`, and available embedded calibration reference IDs (`EPSFREF` and
+HISTORY). Raw PSF measurements include the selected zone, oversampling, reference
+ID, fit position and diagnostics. Raw measurements also record the sampled bandwidth and
 wavelength source. Aperture fluxes remain finite-aperture measurements; this
 stage adds no aperture-to-total-flux correction.
 

@@ -30,6 +30,7 @@ from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 from packaging.version import Version
+from photutils.psf import ImagePSF
 from photutils.aperture import CircularAnnulus, CircularAperture, ApertureStats, aperture_photometry
 from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import shift as ndi_shift, map_coordinates
@@ -61,8 +62,8 @@ class PipelineConfig:
     Select data_release to query or read a single release, or leave it unset
     to infer an unambiguous release from all inputs. Calibration paths, cutout
     caches and outputs are scoped by release. Unknown or mixed provenance is
-    rejected. QR3 aperture extraction uses full-resolution wavelength maps;
-    QR3 PSF and combined extraction await the EPSF processing stage.
+    rejected. QR3 uses full-resolution wavelength maps and native-pixel
+    evaluation of the embedded EPSF table for PSF photometry.
     """
 
     # ------------------------------------------------------------------
@@ -210,10 +211,10 @@ class PipelineConfig:
     # PSF photometry
     # ------------------------------------------------------------------
     psf_kernel_radius_native: int = 5
-    """Half-size of the rebinned native-pixel PSF kernel."""
+    """Half-size of the native fitting window; QR3 renders EPSF at pixel centers."""
 
     psf_shift_sign: float = 1.0
-    """Sign convention applied to the subpixel PSF shift."""
+    """QR2 optical-PSF shift convention; QR3 EPSF uses physical pixel coordinates."""
 
     psf_fit_background_gradient: bool = False
     """If True, include linear x/y background-gradient terms in the PSF fit."""
@@ -1157,8 +1158,8 @@ def qr3_wavelength(header, image_shape, x, y, detector, cfg):
 
 
 def require_supported_photometry(release, cfg):
-    if release == "qr3" and str(cfg.photometry_method).strip().lower() != "aperture":
-        raise NotImplementedError("QR3 supports aperture photometry only; EPSF photometry is not implemented yet.")
+    if str(cfg.photometry_method).strip().lower() not in ("aperture", "psf", "both"):
+        raise ValueError(f"Unsupported photometry method: {cfg.photometry_method}")
 
 
 def detector_from_header(header) -> int:
@@ -1338,6 +1339,9 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                 var_hdu = hdul["VARIANCE"].copy() if "VARIANCE" in hdul else None
                 zodi_hdu = hdul["ZODI"].copy() if "ZODI" in hdul else None
                 psf_hdu = hdul["PSF"].copy() if "PSF" in hdul else None
+                epsf_hdu = hdul["EPSF"].copy() if "EPSF" in hdul else None
+                if release == "qr3" and cfg.photometry_method in ("psf", "both") and epsf_hdu is None:
+                    raise ValueError("QR3 PSF photometry requires an embedded EPSF table.")
 
                 header = image_hdu.header
                 detector = detector_from_header(header)
@@ -1412,6 +1416,10 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                     "variance_hdu": var_hdu,
                     "zodi_hdu": zodi_hdu,
                     "psf_hdu": psf_hdu,
+                    "epsf_hdu": epsf_hdu,
+                    "epsf_reference": next((str(line).split("epsf ", 1)[1].strip()
+                                            for line in header.get("HISTORY", [])
+                                            if str(line).startswith("[CALIB] epsf ")), ""),
                     "x_src": float(x_src),
                     "y_src": float(y_src),
                     "central_wavelength_um": wavelength_um,
@@ -1816,12 +1824,86 @@ def count_bad_aperture_flags(flags, x, y, radius_pix, flag_bits):
     return int(np.count_nonzero((ap_flags & mask_value) != 0))
 
 
+def select_epsf_zone(hdul, x, y):
+    """Select the nearest zone center in the parent detector's zero-based sky grid.
+
+    Use table coordinates, never row ordering or a square-grid assumption.
+    The half-pixel border in the published zone widths accommodates edge pixels.
+    """
+    hdu = hdul["EPSF"]
+    if not isinstance(hdu, fits.BinTableHDU) or hdu.data is None:
+        raise ValueError("EPSF must be a nonempty binary table.")
+    required = {"EPSF", "BINX", "BINY", "XCENTER", "YCENTER", "XWIDTH", "YWIDTH"}
+    if not required.issubset(hdu.columns.names):
+        raise ValueError("EPSF table is missing zone geometry or model columns.")
+    if hdu.header.get("DETCOORD", "").strip().lower() != "sky":
+        raise ValueError("EPSF table must use sky detector coordinates.")
+    image = hdul["IMAGE"]
+    detector = detector_from_header(image.header)
+    if int(hdu.header.get("DETECTOR", -1)) != detector:
+        raise ValueError("EPSF detector does not match image detector.")
+    dx, dy = qr3_parent_coordinates(image.header, image.data.shape, (2040, 2040))
+    xp, yp = float(x) + dx, float(y) + dy
+    if not (np.isfinite(xp) and np.isfinite(yp) and 0 <= xp < 2040 and 0 <= yp < 2040):
+        raise ValueError("EPSF source position is outside the parent detector.")
+    table = hdu.data
+    xc, yc = np.asarray(table['XCENTER']), np.asarray(table['YCENTER'])
+    width, height = np.asarray(table['XWIDTH']), np.asarray(table['YWIDTH'])
+    if (len(table) == 0 or not all(np.all(np.isfinite(v)) for v in (xc, yc, width, height))
+            or np.any(width <= 0) or np.any(height <= 0)):
+        raise ValueError("Invalid EPSF zone geometry.")
+    index = int(np.argmin((xc - xp)**2 + (yc - yp)**2))
+    if (abs(xp - xc[index]) > width[index] / 2 + 1.e-4
+            or abs(yp - yc[index]) > height[index] / 2 + 1.e-4):
+        raise ValueError("EPSF table has no zone covering the source position.")
+    oversampling = (float(hdu.header.get('OVSMPY', 0)), float(hdu.header.get('OVSMPX', 0)))
+    if not all(np.isfinite(v) and v >= 1 and v == int(v) for v in oversampling):
+        raise ValueError("EPSF OVSMPX/OVSMPY must be positive integers.")
+    return index, tuple(int(v) for v in oversampling)
+
+
+def extract_spherex_epsf_kernel(hdul, x, y, cfg):
+    """Render an effective PSF at native pixel centers, then normalize full support.
+
+    This follows IRSA's ImagePSF rendering recipe. Do not integrate detector
+    pixels again: their response is already part of the ePSF. Normalize before
+    truncating to the requested fitting radius or clipping to image/mask bounds.
+    """
+    index, oversampling = select_epsf_zone(hdul, x, y)
+    hdu = hdul['EPSF']
+    models = getattr(hdu, '_spexpi_models', None)
+    if models is None:
+        models = hdu._spexpi_models = {}
+    if index not in models:
+        data = np.asarray(hdu.data['EPSF'][index], dtype=float)
+        if (data.ndim != 2 or min(data.shape) < 4 or any(n % 2 != 1 for n in data.shape)
+                or not np.all(np.isfinite(data)) or np.sum(data) <= 0):
+            raise ValueError("Invalid EPSF image array.")
+        models[index] = ImagePSF(data=data, oversampling=oversampling, fill_value=0.)
+    model = models[index]
+    radius = int(cfg.psf_kernel_radius_native)
+    if radius < 1 or radius != cfg.psf_kernel_radius_native:
+        raise ValueError("PSF kernel radius must be a positive integer.")
+    support = max(radius, int(np.ceil(max((np.array(model.data.shape) - 1) / 2
+                                         / np.array(oversampling)))) + 1)
+    yy, xx = np.mgrid[-support:support+1, -support:support+1]
+    values = model.evaluate(xx + np.round(x), yy + np.round(y), flux=1., x_0=x, y_0=y)
+    total = float(np.sum(values))
+    if not np.all(np.isfinite(values)) or not np.isfinite(total) or total <= 0:
+        raise ValueError("EPSF native rendering has nonpositive or invalid normalization.")
+    values = values / total
+    start = support - radius
+    return values[start:start+2*radius+1, start:start+2*radius+1]
+
+
 def extract_spherex_psf_kernel(hdul, x, y, cfg: PipelineConfig):
     """
     Extract a native-pixel SPHEREx PSF kernel from the PSF extension.
     """
+    if "EPSF" in hdul:
+        return extract_spherex_epsf_kernel(hdul, x, y, cfg)
     if "PSF" not in hdul:
-        raise ValueError("No PSF extension present in this cutout.")
+        raise ValueError("No PSF or EPSF extension present in this cutout.")
 
     psf_cube = hdul["PSF"].data
     psf_header = hdul["PSF"].header
@@ -1890,7 +1972,7 @@ def extract_spherex_psf_kernel(hdul, x, y, cfg: PipelineConfig):
     return psf_native
 
 
-def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfig):
+def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfig, *, normalize_psf=True):
     """
     Weighted linear PSF photometry in uJy.
 
@@ -1904,7 +1986,8 @@ def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfi
     psf_sum = np.nansum(psf)
     if not np.isfinite(psf_sum) or psf_sum <= 0:
         return np.nan, np.nan, {"psf_status": "bad_psf"}
-    psf /= psf_sum
+    if normalize_psf:
+        psf /= psf_sum
 
     ph, pw = psf.shape
     x0 = int(np.round(x))
@@ -2022,7 +2105,7 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
 
     if (not cfg.enable_psf_local_grid_search) or detector not in tuple(cfg.psf_grid_search_enabled_detectors):
         psf_kernel = extract_spherex_psf_kernel(hdul_like, x, y, cfg)
-        flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg)
+        flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg, normalize_psf="EPSF" not in hdul_like)
         info = dict(info)
         info.update({
             "psf_grid_status": "disabled",
@@ -2064,6 +2147,7 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
                     y_try,
                     psf_kernel,
                     cfg,
+                    normalize_psf="EPSF" not in hdul_like,
                 )
             except Exception as exc:
                 continue
@@ -2091,7 +2175,7 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
         # Fall back to the unshifted position.
         try:
             psf_kernel = extract_spherex_psf_kernel(hdul_like, x, y, cfg)
-            flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg)
+            flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg, normalize_psf="EPSF" not in hdul_like)
         except Exception as exc:
             return np.nan, np.nan, {
                 "psf_status": f"psf_error:{type(exc).__name__}",
@@ -2243,7 +2327,6 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
     if sapm_key not in sapm_cache:
         sapm_cache[sapm_key] = load_sapm(detector, cfg, data_release)
     sapm_data, sapm_header = sapm_cache[sapm_key]
-    require_supported_photometry(data_release, cfg)
     if data_release == "qr3":
         qr3_parent_coordinates(header, image.shape, sapm_data.shape)
         if sapm_header.get("DETCOORD", "").strip().lower() != "sky":
@@ -2320,9 +2403,18 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
         psf_info = {"psf_status": "not_run"}
 
         try:
-            if row.get("psf_hdu") is None:
-                raise ValueError("No PSF HDU available.")
-            hdul_like = fits.HDUList([fits.PrimaryHDU(), image_hdu, row["psf_hdu"]])
+            model_hdu = row.get("epsf_hdu") if data_release == "qr3" else row.get("psf_hdu")
+            if model_hdu is None:
+                raise ValueError("No appropriate PSF/EPSF HDU available.")
+            fit_image = image_hdu
+            if data_release == "qr3":
+                fit_header = header.copy()
+                fit_header["CRPIX1A"] = float(header.get("CRPIX1A", 1)) - image_slices[1].start
+                fit_header["CRPIX2A"] = float(header.get("CRPIX2A", 1)) - image_slices[0].start
+                fit_image = fits.ImageHDU(image, header=fit_header, name="IMAGE")
+            hdul_like = fits.HDUList([fits.PrimaryHDU(), fit_image, model_hdu])
+            if data_release == "qr3":
+                extract_spherex_epsf_kernel(hdul_like, x, y, cfg)
             psf_flux_uJy, psf_err_uJy, psf_info = psf_flux_fit_with_local_grid_search(
                 hdul_like,
                 flux_ujy,
@@ -2333,11 +2425,22 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
                 detector=detector,
                 cfg=cfg,
             )
+            if data_release == "qr3" and np.isfinite(psf_flux_uJy):
+                index, ovs = select_epsf_zone(hdul_like, psf_info['psf_x_fit'], psf_info['psf_y_fit'])
+                zone = model_hdu.data[index]
+                psf_info.update({"psf_model": "EPSF", "epsf_reference": row.get("epsf_reference", ""),
+                                 "epsf_binx": int(zone['BINX']),
+                                 "epsf_biny": int(zone['BINY']), "epsf_oversamp_x": ovs[1],
+                                 "epsf_oversamp_y": ovs[0]})
         except Exception as exc:
+            if data_release == "qr3":
+                raise ValueError(f"QR3 EPSF photometry failed: {exc}") from exc
             psf_info = {"psf_status": f"psf_error:{type(exc).__name__}"}
 
         measurements.append({
             "wavelength": float(row["central_wavelength_um"]),
+            "bandwidth_um": row.get("bandwidth_um", np.nan),
+            "wavelength_source": row.get("wavelength_source", "WCS-WAVE"),
             "flux": psf_flux_uJy * 1e-6 if np.isfinite(psf_flux_uJy) else np.nan,
             "err": psf_err_uJy * 1e-6 if np.isfinite(psf_err_uJy) else np.nan,
             "flux_uJy": psf_flux_uJy,
@@ -3245,6 +3348,15 @@ def save_spectrum_fits(
     if cfg.pmdec_masyr is not None:
         hdu0.header["PMDEC"] = (float(cfg.pmdec_masyr), "Proper motion Dec [mas/yr]")
     hdu0.header["PHOTMET"] = (method, "Photometry method used for this spectrum")
+    if data_release == "qr3" and method == "psf":
+        hdu0.header["PSFMODEL"] = "EPSF"
+        hdu0.header["PSFNORM"] = ("FULL", "Normalize native full model before fit-window clipping")
+        hdu0.header["ERRTYPE"] = ("FORMAL", "Fit covariance; no archive systematic floor added")
+        references = getattr(cfg, "_epsf_references", [])
+        if references:
+            hdu0.header["EPSFREF"] = references[0] if len(references) == 1 else "MULTIPLE"
+            for reference in references:
+                hdu0.header.add_history(f"Embedded EPSF calibration: {reference}")
     if coord_stats is not None:
         add_epoch_adjusted_coordinate_header(hdu0.header, coord_stats)
 
@@ -3659,6 +3771,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
         print("WARNING: could not infer SPHEREx data release from opened cutouts.")
     print(f"Opened {len(good_cutouts)} usable cutouts")
 
+    cfg._epsf_references = sorted({r["epsf_reference"] for r in good_cutouts if r.get("epsf_reference")})
     coord_stats = compute_epoch_adjusted_coordinate_stats(good_cutouts)
     print_epoch_adjusted_coordinate_stats(coord_stats)
 

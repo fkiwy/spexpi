@@ -109,8 +109,8 @@ class ReleaseTests(unittest.TestCase):
                 p.run_spherex_pipeline(1, 2)
             downloaded.assert_not_called()
         with patch.object(p, 'query_spherex_cutouts') as query:
-            with self.assertRaises(NotImplementedError):
-                p.run_spherex_pipeline(1, 2, cfg=p.PipelineConfig(data_release='qr3', photometry_method='psf'))
+            with self.assertRaises(ValueError):
+                p.run_spherex_pipeline(1, 2, cfg=p.PipelineConfig(data_release='qr3', photometry_method='invalid'))
             query.assert_not_called()
 
     def test_explicit_calibration_release_beats_previous_runtime_state(self):
@@ -130,8 +130,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("a.uri LIKE '%/spherex/qr3/%'", query)
 
     def test_pipeline_guards_before_photometry_and_isolates_outputs(self):
-        for releases, error in ((['qr2', 'qr3'], ValueError), (['unknown'], ValueError),
-                                (['qr3'], NotImplementedError)):
+        for releases, error in ((['qr2', 'qr3'], ValueError), (['unknown'], ValueError)):
             with self.subTest(releases=releases), \
                  patch.object(p, 'prepare_cached_cutout_rows', return_value=[{'data_release': r} for r in releases]), \
                  patch.object(p, 'open_cutouts_parallel') as opened:

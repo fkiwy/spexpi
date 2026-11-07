@@ -200,12 +200,13 @@ class QR3ApertureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'QR3 spectral-channel'):
                 p.load_spectral_channels_calibration(self.cfg,'qr3')
 
-    def test_qr3_psf_and_both_fail_before_processing(self):
+    def test_qr3_psf_and_both_require_embedded_epsf(self):
         path,_=self.make_cutout()
         for method in ('psf','both'):
             self.cfg.photometry_method=method
-            with self.assertRaisesRegex(NotImplementedError,'EPSF'):
-                p.process_cutout_row({'local_uri':str(path),'data_release':'qr3'},24.24,9.56,self.cfg)
+            row=p.process_cutout_row({'local_uri':str(path),'data_release':'qr3','cutout_index':1},24.24,9.56,self.cfg)
+            self.assertIn('EPSF',row['open_error'])
+            self.assertNotIn('image_hdu',row)
 
 
 if __name__=='__main__':
