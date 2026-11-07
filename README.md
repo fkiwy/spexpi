@@ -99,20 +99,41 @@ can be slower because remote FITS access may require reading large portions of t
 
 ### 3. Data release handling
 
-The pipeline is designed to be release-aware without requiring a user-facing `data_release` parameter. It attempts to
-infer the release from:
+Set `PipelineConfig(data_release="qr2")` to select a release for archive queries
+and cached runs. With `data_release=None`, every input must have identifiable,
+consistent provenance. Unknown releases, conflicting FITS/path metadata, and mixed
+release batches raise errors rather than falling back to QR2. Supported release
+identifiers are `qr1`, `qr2`, `qr2_deep`, and `qr3` (QR1 archive availability is
+independent of identifier recognition).
 
-1. the original IRSA URL or S3 key;
-2. the local cached file path;
-3. FITS header keywords such as `DATAREL`, `OBS_COLLECTION`, `COLLECTION`, or related variants.
+**QR3 stage one:** release detection, calibration selection and cache separation
+are implemented. Full QR3 extraction deliberately raises `NotImplementedError`
+until the calibration/aperture and ePSF processing stages are validated.
 
-When possible, downloaded FITS files are stamped with:
+New cutouts use `download_dir/<release>/<object_name>/`; legacy
+`download_dir/<object_name>/` caches remain readable when their release can be
+established. Calibration caches retain their `<release>/<collection>/` layout.
+Pipeline products are written under `output_dir/<release>/` to avoid overwriting
+another release's results. Existing bundled QR2 products are left in place.
 
-```text
-DATAREL = <release>
+Leave `sapm_collection` and `spectral_channels_collection` as `None` to choose:
+
+| Release | Solid-angle pixel map | Spectral channels |
+| --- | --- | --- |
+| QR2 / QR2 deep | `cal-sapm-v2-2025-164` | `cal-sch-v1-2026-106` |
+| QR3 | `cal-sapm-v3-2026-191` | `cal-sch-v2-2026-229` |
+
+Explicit collection strings remain expert overrides; they must match the input
+release. The QR3 channel filename is uncompressed `.fits`. These defaults were
+checked against the [public archive](https://nasa-irsa-spherex.s3.amazonaws.com/?list-type=2&prefix=qr3/&delimiter=/).
+See the [IRSA release documentation](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/overview_qr.html)
+for the distinction between QR3 observations and DR1 reprocessing.
+
+Run the release regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
 ```
-
-This makes cached runs self-contained even when the original URL is no longer available.
 
 ### 4. Calibration
 
@@ -272,6 +293,7 @@ pmra, pmdec = 1238.244, -16.156
 ref_epoch = 2016.0
 
 cfg = PipelineConfig(
+    data_release="qr2",
     # Photometry mode: "aperture", "psf", or "both".
     # "both" writes independent aperture and PSF spectra/plots in one run.
     photometry_method="both",
@@ -299,7 +321,7 @@ cfg = PipelineConfig(
     use_spectral_channels_for_binning=True,
     spectral_channels_bin_by="integrate",
     spectral_channels_min_points_per_bin=1,
-    spectral_channels_collection="cal-sch-v1-2026-106",
+    spectral_channels_collection=None,
 
     # Download/cache settings
     cutout_size_arcsec=120,
@@ -313,7 +335,7 @@ cfg = PipelineConfig(
     # Calibration cache settings
     sapm_cache_dir="../resources/spherex_calibration_files/spherex_sapm_cache",
     redownload_sapm_files=False,
-    sapm_collection="cal-sapm-v2-2025-164",
+    sapm_collection=None,
     spectral_channels_cache_dir="../resources/spherex_calibration_files/spherex_spectral_channels_cache",
     redownload_spectral_channels=False,
 
@@ -347,10 +369,10 @@ spectra, measurements = run_spherex_pipeline(
 Expected products include:
 
 ```text
-../resources/objects/spectra/fits/T2 SIMP J013656.5+093347.3_aperture_spectrum.fits
-../resources/objects/spectra/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits
-../resources/objects/spectra/plots/T2 SIMP J013656.5+093347.3_aperture_spectrum.pdf
-../resources/objects/spectra/plots/T2 SIMP J013656.5+093347.3_psf_spectrum.pdf
+../resources/objects/spectra/qr2/fits/T2 SIMP J013656.5+093347.3_aperture_spectrum.fits
+../resources/objects/spectra/qr2/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits
+../resources/objects/spectra/qr2/plots/T2 SIMP J013656.5+093347.3_aperture_spectrum.pdf
+../resources/objects/spectra/qr2/plots/T2 SIMP J013656.5+093347.3_psf_spectrum.pdf
 ```
 
 When `photometry_method="aperture"` or `photometry_method="psf"`, the first return value is a single
@@ -972,7 +994,7 @@ Create a compact object name from coordinates.
 | `cache_sapm_files`      |                                           `True` | Cache detector solid-angle pixel maps locally after first use.                 |
 | `sapm_cache_dir`        | `"spherex_calibration_files/spherex_sapm_cache"` | Base directory for cached solid-angle pixel maps, grouped by inferred release. |
 | `redownload_sapm_files` |                                          `False` | If `True`, refresh cached solid-angle pixel maps from S3.                      |
-| `sapm_collection`       |                         `"cal-sapm-v2-2025-164"` | Calibration collection name for the solid-angle pixel maps.                    |
+| `sapm_collection`       |                         `None` | Release-specific SAPM default; string values override it.                    |
 
 ### Photometry mode
 
@@ -1030,7 +1052,7 @@ Create a compact object name from coordinates.
 | `spectral_channels_bin_by`             |                                                       `"integrate"` | Binning mode for `spectral_channels`: `'integrate'`, `'edges'`, or `'nearest'`.                |
 | `spectral_channels_min_points_per_bin` |                                                                 `1` | Minimum number of measurements required in a spectral-channel bin.                             |
 | `spectral_channels_integrate_errors`   |                                                      `"quadrature"` | Uncertainty propagation for integrated bins: `'quadrature'` or `'weighted'`.                   |
-| `spectral_channels_collection`         |                                             `"cal-sch-v1-2026-106"` | Optional `spectral_channels` calibration collection name used to build default S3 paths.       |
+| `spectral_channels_collection`         |                                             `None` | Release-specific spectral-channel default; string values override it.       |
 | `spectral_channels_s3_template`        |                                                              `None` | Optional S3 template for `spectral_channels`; may include `{data_release}` and `{collection}`. |
 | `spectral_channels_cache_dir`          | `"spherex_calibration_files/`<br>`spherex_spectral_channels_cache"` | Base directory for cached `spectral_channels` calibration files.                               |
 | `redownload_spectral_channels`         |                                                             `False` | If `True`, refresh cached `spectral_channels` calibration files from S3.                       |

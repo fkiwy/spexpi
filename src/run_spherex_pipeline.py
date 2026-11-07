@@ -130,6 +130,7 @@ psf_local_grid_half_range_pix = 1.0
 outlier_nbr_of_bins = 8
 
 cfg = PipelineConfig(
+    data_release="qr2",  # QR3 extraction is gated until its later stages are implemented.
 
     # ============================================================
     # 1. PHOTOMETRY MODE & CORE SETTINGS
@@ -182,7 +183,7 @@ cfg = PipelineConfig(
 
     spectral_channels_cache_dir="../resources/spherex_calibration_files/spherex_spectral_channels_cache",
     redownload_spectral_channels=False,
-    spectral_channels_collection="cal-sch-v1-2026-106",
+    spectral_channels_collection=None,
 
     # ============================================================
     # 5. DATA INPUT / DOWNLOAD / CACHING
@@ -204,7 +205,7 @@ cfg = PipelineConfig(
     # ============================================================
     sapm_cache_dir="../resources/spherex_calibration_files/spherex_sapm_cache",
     redownload_sapm_files=False,
-    sapm_collection="cal-sapm-v2-2025-164",
+    sapm_collection=None,
 
     # ============================================================
     # 7. OUTPUT & VISUALIZATION

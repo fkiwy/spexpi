@@ -8,7 +8,7 @@ import math
 import re
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -36,6 +36,15 @@ from tqdm.auto import tqdm
 VERSION_FIXED = Version("6.5.6")
 PSF_FIX_TAG = "psffix1"
 
+# Collection identifiers are release-specific; never reuse QR2 defaults for QR3.
+RELEASE_CALIBRATIONS = {
+    "qr1": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
+    "qr2": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
+    "qr2_deep": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
+    "qr3": {"sapm": "cal-sapm-v3-2026-191", "spectral_channels": "cal-sch-v2-2026-229"},
+}
+
+
 logging.getLogger("astropy").setLevel(logging.WARNING)
 
 
@@ -44,16 +53,19 @@ class PipelineConfig:
     """
     User-facing configuration for the SPHEREx aperture/PSF extraction pipeline.
 
-    The SPHEREx data release is deliberately not a configurable parameter.  The
-    pipeline infers it from the downloaded image URLs or local file paths (for
-    example, paths containing ``/spherex/qr2/``).  Calibration S3 paths are then
-    built from that inferred release so image data and calibration files remain
-    consistent.
+    Select data_release to query or read a single release, or leave it unset
+    to infer an unambiguous release from all inputs. Calibration paths, cutout
+    caches and outputs are scoped by release. Unknown or mixed provenance is
+    rejected. QR3 extraction remains gated until its calibration and EPSF
+    processing stages are implemented.
     """
 
     # ------------------------------------------------------------------
     # IRSA query and parallel execution
     # ------------------------------------------------------------------
+    data_release: str | None = None
+    """Select qr1, qr2, qr2_deep or qr3; None requires unambiguous input provenance."""
+
     tap_url: str = "https://irsa.ipac.caltech.edu/TAP"
     """IRSA TAP service URL used to discover SPHEREx image artifacts."""
 
@@ -135,8 +147,8 @@ class PipelineConfig:
     redownload_sapm_files: bool = False
     """If True, refresh cached solid-angle pixel maps from S3."""
 
-    sapm_collection: str = "cal-sapm-v2-2025-164"
-    """Calibration collection name for the solid-angle pixel maps."""
+    sapm_collection: str | None = None
+    """Explicit SAPM collection override; None selects the release-specific default."""
 
     # ------------------------------------------------------------------
     # Aperture photometry and local background estimation
@@ -258,7 +270,7 @@ class PipelineConfig:
     spectral_channels_integrate_errors: str = "quadrature"
     """Uncertainty propagation for integrated bins: 'quadrature' or 'weighted'."""
 
-    spectral_channels_collection: str | None = "cal-sch-v1-2026-106"
+    spectral_channels_collection: str | None = None
     """Optional spectral_channels calibration collection name used to build default S3 paths."""
 
     spectral_channels_s3_template: str | None = None
@@ -351,6 +363,8 @@ def validate_config(cfg: PipelineConfig) -> None:
     unsupported download backend or photometry method without trying to validate
     every scientific choice.
     """
+    if cfg.data_release is not None and normalize_data_release(cfg.data_release) == "unknown":
+        raise ValueError(f"Unsupported SPHEREx data_release={cfg.data_release!r}.")
     backend = str(cfg.download_backend).lower().strip()
     if backend not in ("http", "s3", "s3_cutout"):
         raise ValueError(f"Unsupported download_backend={cfg.download_backend!r}; use 'http' or 's3_cutout'.")
@@ -461,7 +475,11 @@ def safe_filename(text: str, max_len: int = 120) -> str:
 
 def get_object_download_dir(cfg: PipelineConfig, object_name: str) -> Path:
     """Return the dedicated download/cache directory for one object."""
-    path = Path(cfg.download_dir) / safe_filename(object_name)
+    release = get_runtime_data_release(cfg, cfg.data_release or "unknown")
+    path = Path(cfg.download_dir)
+    if release != "unknown":
+        path = path / release
+    path = path / safe_filename(object_name)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -494,7 +512,7 @@ def s3_key_from_irsa_uri(uri: str) -> str:
                 return key
 
     stripped = path.lstrip("/")
-    if stripped.startswith(("qr1/", "qr2/", "qr2_deep/", "cal-", "level2_")):
+    if stripped.startswith(("qr1/", "qr2/", "qr2_deep/", "qr3/", "cal-", "level2_")):
         return stripped
 
     raise ValueError(f"Cannot map URI to SPHEREx S3 key: {uri}")
@@ -551,6 +569,9 @@ def stamp_data_release_in_fits(path: str | Path, data_release: str) -> None:
     if release == "unknown":
         return
     try:
+        existing = infer_data_release_from_fits(path)
+        if existing != "unknown" and existing != release:
+            raise ValueError(f"Refusing to replace {existing} provenance with {release} in {path}")
         with fits.open(path, mode="update", memmap=False) as hdul:
             for hdu in hdul:
                 try:
@@ -558,6 +579,8 @@ def stamp_data_release_in_fits(path: str | Path, data_release: str) -> None:
                 except Exception:
                     pass
             hdul.flush()
+    except ValueError:
+        raise
     except Exception:
         # Do not fail the download if the file cannot be stamped.
         pass
@@ -704,6 +727,13 @@ def prepare_cutout_row_file(row, object_download_dir: Path, cfg: PipelineConfig,
     """Ensure one cutout is available locally and return a row-like dict with local_uri."""
     uri = str(_row_value(row, "uri", ""))
     cutout_index = int(_row_value(row, "cutout_index", 0))
+    release = infer_data_release_from_uri(uri)
+    if release == "unknown":
+        raise ValueError(f"Cannot establish SPHEREx release from download URI: {uri}")
+    if cfg.data_release is not None and release != normalize_data_release(cfg.data_release):
+        raise ValueError("Download release conflicts with selected release.")
+    object_download_dir = Path(cfg.download_dir) / release / object_download_dir.name
+    object_download_dir.mkdir(parents=True, exist_ok=True)
     local_file = object_download_dir / filename_from_uri(uri, cutout_index)
     existed_before = local_file.exists() and local_file.stat().st_size > 0
     backend = str(getattr(cfg, "download_backend", "http") or "http").lower().strip()
@@ -746,63 +776,77 @@ def prepare_cutout_row_file(row, object_download_dir: Path, cfg: PipelineConfig,
         "download_error": str(last_exc),
         "data_release": infer_data_release_from_uri(uri)
         if infer_data_release_from_uri(uri) != "unknown"
-        else infer_data_release_from_fits(local_file),
+        else "unknown",
     }
 
 
 def normalize_data_release(release: object) -> str:
     """Return a canonical lower-case SPHEREx data-release token."""
     text = str(release or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if "qr2_deep" in text or text in {"spherex_qr2_deep", "qr2deep"}:
-        return "qr2_deep"
-    if "qr2" in text or text == "spherex_qr2":
-        return "qr2"
-    if "qr1" in text or text == "spherex_qr1":
-        return "qr1"
-    return "unknown"
+    aliases = {"qr2deep": "qr2_deep", "spherex_qr2deep": "qr2_deep"}
+    text = aliases.get(text, text.removeprefix("spherex_"))
+    return text if text in RELEASE_CALIBRATIONS else "unknown"
 
 
 def infer_data_release_from_uri(uri: str) -> str:
-    """Infer the SPHEREx data release from an IRSA/S3/local path or URL."""
+    """Recognize complete release path components, never substrings such as qr30."""
     text = str(uri or "").lower().replace("\\", "/")
-    # Check qr2_deep first because it also contains the substring "qr2".
-    if "/spherex/qr2_deep/" in text or "spherex_qr2_deep" in text or "/qr2_deep/" in text:
-        return "qr2_deep"
-    if "/spherex/qr2/" in text or "spherex_qr2" in text or "/qr2/" in text or text.startswith("qr2/"):
-        return "qr2"
-    if "/spherex/qr1/" in text or "spherex_qr1" in text or "/qr1/" in text or text.startswith("qr1/"):
-        return "qr1"
-    return "unknown"
+    path = urllib.parse.unquote(urllib.parse.urlparse(text).path)
+    releases = {normalize_data_release(part) for part in path.split("/")}
+    releases.discard("unknown")
+    if len(releases) > 1:
+        raise ValueError(f"Conflicting SPHEREx releases in path: {uri}")
+    return next(iter(releases), "unknown")
 
 
 def infer_data_release_from_header(header) -> str:
     """Infer the data release from common FITS header keywords when present."""
     if header is None:
         return "unknown"
-    for key in ("DATAREL", "DATA_REL", "OBS_COLLECTION", "OBS-COLL", "COLLECTION", "OBSCOL"):
-        try:
-            release = normalize_data_release(header.get(key))
-            if release != "unknown":
-                return release
-        except Exception:
-            continue
-    return "unknown"
+    releases = {normalize_data_release(header.get(key)) for key in
+                ("DATAREL", "DATA_REL", "OBS_COLLECTION", "OBS-COLL", "COLLECTION", "OBSCOL")}
+    releases.discard("unknown")
+    if len(releases) > 1:
+        raise ValueError("Conflicting SPHEREx release keywords in FITS header.")
+    return next(iter(releases), "unknown")
 
 
 def infer_data_release_from_fits(path: str | Path) -> str:
     """Infer the data release from a local FITS path and, if needed, its headers."""
-    release = infer_data_release_from_uri(str(path))
-    if release != "unknown":
-        return release
-    try:
-        with fits.open(path, memmap=False) as hdul:
-            for hdu in hdul:
-                release = infer_data_release_from_header(getattr(hdu, "header", None))
-                if release != "unknown":
-                    return release
-    except Exception:
-        pass
-    return "qr2"
+    releases = {infer_data_release_from_uri(str(path))}
+    with fits.open(path, memmap=False) as hdul:
+        for hdu in hdul:
+            releases.add(infer_data_release_from_header(hdu.header))
+    releases.discard("unknown")
+    if len(releases) > 1:
+        raise ValueError(f"Conflicting SPHEREx release metadata in {path}")
+    return next(iter(releases), "unknown")
+
+
+def calibration_collection(cfg: PipelineConfig, data_release: str, kind: str) -> str:
+    """Resolve an explicit override or the default for a known release."""
+    release = normalize_data_release(data_release)
+    if release == "unknown":
+        raise ValueError("Cannot select calibration: unknown SPHEREx data release.")
+    if kind not in ("sapm", "spectral_channels"):
+        raise ValueError(f"Unsupported calibration kind: {kind}")
+    override = cfg.sapm_collection if kind == "sapm" else cfg.spectral_channels_collection
+    return override or RELEASE_CALIBRATIONS[release][kind]
+
+
+def require_single_data_release(rows: list[dict], selected: str | None = None) -> str:
+    """Reject missing, conflicting, or mixed provenance before processing science data."""
+    if not rows:
+        raise ValueError("No SPHEREx cutouts found.")
+    releases = {normalize_data_release(row.get("data_release")) for row in rows}
+    if "unknown" in releases:
+        raise ValueError("Cannot establish the SPHEREx release for every cutout; provide release metadata.")
+    if len(releases) != 1:
+        raise ValueError("Mixed SPHEREx releases are not supported; extract each release separately.")
+    release = next(iter(releases))
+    if selected is not None and release != normalize_data_release(selected):
+        raise ValueError(f"Cutout release {release} conflicts with selected release {selected}.")
+    return release
 
 
 def set_runtime_data_release(cfg: PipelineConfig, release: str) -> str:
@@ -886,8 +930,8 @@ def make_sapm_s3_paths(cfg: PipelineConfig, data_release: str) -> dict[int, str]
     return {
         det: (
             f"nasa-irsa-spherex/{release}/{dataset_type}/"
-            f"{cfg.sapm_collection}/{det}/"
-            f"{dataset_type}_D{det}_spx_{cfg.sapm_collection}.fits"
+            f"{calibration_collection(cfg, data_release, 'sapm')}/{det}/"
+            f"{dataset_type}_D{det}_spx_{calibration_collection(cfg, data_release, 'sapm')}.fits"
         )
         for det in range(1, 7)
     }
@@ -898,14 +942,14 @@ def get_sapm_cache_dir(cfg: PipelineConfig, data_release: str) -> Path:
     release = normalize_data_release(data_release)
     if release == "unknown":
         raise ValueError("Cannot choose SAPM cache directory because the SPHEREx data release is unknown.")
-    path = Path(cfg.sapm_cache_dir) / release / cfg.sapm_collection
+    path = Path(cfg.sapm_cache_dir) / release / calibration_collection(cfg, data_release, "sapm")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def sapm_local_path(detector: int, cfg: PipelineConfig, data_release: str) -> Path:
     """Return local cached filename for one detector SAPM file."""
-    return get_sapm_cache_dir(cfg, data_release) / f"solid_angle_pixel_map_D{int(detector)}_spx_{cfg.sapm_collection}.fits"
+    return get_sapm_cache_dir(cfg, data_release) / f"solid_angle_pixel_map_D{int(detector)}_spx_{calibration_collection(cfg, data_release, 'sapm')}.fits"
 
 
 def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[dict]:
@@ -918,10 +962,12 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
     The filename order is used as the cutout order.
     """
     object_download_dir = get_object_download_dir(cfg, object_name)
-    files = sorted(
-        p for p in object_download_dir.glob(cfg.cached_cutout_glob)
-        if p.is_file() and not p.name.endswith(".part")
-    )
+    directories = {object_download_dir, Path(cfg.download_dir) / safe_filename(object_name)}
+    if cfg.data_release is None:
+        directories.update(Path(cfg.download_dir) / release / safe_filename(object_name)
+                           for release in RELEASE_CALIBRATIONS)
+    files = sorted({p for directory in directories for p in directory.glob(cfg.cached_cutout_glob)
+                    if p.is_file() and not p.name.endswith(".part")})
 
     rows = []
     iterator = files
@@ -929,6 +975,11 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
         iterator = tqdm(files, total=len(files), desc=f"Reading cached list for {object_name}", unit="file")
 
     for idx, path in enumerate(iterator, start=1):
+        release = infer_data_release_from_fits(path)
+        if cfg.data_release is not None and release != normalize_data_release(cfg.data_release):
+            if release == "unknown":
+                raise ValueError(f"Cannot establish SPHEREx release for cached file: {path}")
+            continue
         rows.append({
             "uri": str(path),
             "local_uri": str(path),
@@ -936,7 +987,7 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
             "time_bounds_lower": np.nan,
             "time_bounds_upper": np.nan,
             "download_status": "local_cache",
-            "data_release": infer_data_release_from_fits(path),
+            "data_release": release,
         })
 
     return rows
@@ -946,6 +997,12 @@ def query_spherex_cutouts(ra: float, dec: float, cfg: PipelineConfig) -> Table:
     """Query IRSA TAP for SPHEREx cutout URLs covering the target position."""
     service = pyvo.dal.TAPService(cfg.tap_url)
     cutout_size_deg = (cfg.cutout_size_arcsec * u.arcsec).to(u.deg).value
+    release_filter = ""
+    if cfg.data_release is not None:
+        release = normalize_data_release(cfg.data_release)
+        if release == "unknown":
+            raise ValueError("Unsupported SPHEREx release for query.")
+        release_filter = f"AND a.uri LIKE '%/spherex/{release}/%'"
     query = f"""
     SELECT
         'https://irsa.ipac.caltech.edu/' || a.uri || '?center={ra},{dec}d&size={cutout_size_deg:7f}' AS uri,
@@ -954,6 +1011,7 @@ def query_spherex_cutouts(ra: float, dec: float, cfg: PipelineConfig) -> Table:
     FROM spherex.artifact a
     JOIN spherex.plane p ON a.planeid = p.planeid
     WHERE 1 = CONTAINS(POINT('ICRS', {ra}, {dec}), p.poly)
+    {release_filter}
     ORDER BY p.time_bounds_lower
     """
     table = service.search(query).to_table()
@@ -1155,6 +1213,14 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
     last_exc = None
     open_path = row.get("local_uri", row.get("uri"))
 
+    file_release = infer_data_release_from_fits(open_path)
+    row_release = normalize_data_release(row.get("data_release"))
+    known = [r for r in (row_release, file_release) if r != "unknown"]
+    release = require_single_data_release(
+        [{"data_release": r} for r in known] or [{"data_release": "unknown"}], cfg.data_release
+    )
+    if release == "qr3":
+        raise NotImplementedError("QR3 cutout processing requires the calibration/aperture and EPSF stages.")
     for attempt in range(cfg.retries):
         try:
             with fits.open(open_path) as old_hdul:
@@ -2254,8 +2320,7 @@ def get_spectral_channels_cache_dir(cfg: PipelineConfig, data_release: str) -> P
     if release == "unknown":
         raise ValueError("Cannot choose spectral_channels cache directory because the SPHEREx data release is unknown.")
     path = Path(cfg.spectral_channels_cache_dir) / release
-    if cfg.spectral_channels_collection:
-        path = path / cfg.spectral_channels_collection
+    path = path / calibration_collection(cfg, release, "spectral_channels")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -2264,20 +2329,19 @@ def _default_spectral_channels_s3_candidates(cfg: PipelineConfig, data_release: 
     """
     Build candidate S3 paths for the spectral_channels calibration file.
 
-    Because SPHEREx calibration collection names may change, this only generates
-    default candidates when cfg.spectral_channels_collection is supplied.
+    Use the release-specific collection unless the caller supplies an override.
     """
     release = normalize_data_release(data_release)
     if release == "unknown":
         return []
-    coll = cfg.spectral_channels_collection
+    coll = calibration_collection(cfg, data_release, "spectral_channels")
     if not coll:
         return []
 
     return [
         (
             f"nasa-irsa-spherex/{release}/spectral_channels/"
-            f"{coll}/spectral_channels_spx_{coll}.fits.gz"
+            f"{coll}/spectral_channels_spx_{coll}.fits" + ("" if release == "qr3" else ".gz")
         ),
         (
             f"nasa-irsa-spherex/{release}/spectral_channels/"
@@ -2295,7 +2359,7 @@ def _render_spectral_channels_template(cfg: PipelineConfig, data_release: str) -
         return None
     return cfg.spectral_channels_s3_template.format(
         data_release=release,
-        collection=cfg.spectral_channels_collection or "",
+        collection=calibration_collection(cfg, release, "spectral_channels"),
     )
 
 
@@ -2305,10 +2369,10 @@ def load_spectral_channels_calibration(cfg: PipelineConfig, data_release: str | 
 
     Returns an astropy Table when possible, otherwise None.
     """
-    release = get_runtime_data_release(cfg, data_release or "unknown")
+    release = (normalize_data_release(data_release) if data_release is not None
+               else get_runtime_data_release(cfg))
     if release == "unknown":
-        logging.warning("Cannot load spectral_channels calibration because the SPHEREx data release is unknown.")
-        return None
+        raise ValueError("Cannot load spectral_channels calibration: unknown SPHEREx data release.")
     cache_dir = get_spectral_channels_cache_dir(cfg, release)
 
     local_candidates = sorted(cache_dir.glob("*.fits")) + sorted(cache_dir.glob("*.fits.gz"))
@@ -3391,14 +3455,25 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
     """Run the full SPHEREx extraction workflow and return the processed spectrum table."""
     if cfg is None:
         cfg = PipelineConfig()
+    cfg = replace(cfg)
     validate_config(cfg)
+    if cfg.data_release is not None:
+        set_runtime_data_release(cfg, cfg.data_release)
     object_name = make_object_name(ra, dec, object_name)
-    ensure_output_directories(cfg.output_dir)
 
     if cfg.query_irsa_for_cutouts:
+        if normalize_data_release(cfg.data_release) == "qr3":
+            raise NotImplementedError("QR3 extraction requires the calibration/aperture and EPSF stages.")
         print("Querying SPHEREx cutouts...")
         cutout_table = query_spherex_cutouts(ra, dec, cfg)
         print(f"Found {len(cutout_table)} cutouts")
+        query_release = require_single_data_release([
+            {"data_release": infer_data_release_from_uri(str(row["uri"]))}
+            for row in cutout_table
+        ], cfg.data_release)
+        if query_release == "qr3":
+            raise NotImplementedError("QR3 extraction requires the calibration/aperture and EPSF stages.")
+        set_runtime_data_release(cfg, query_release)
 
         print("Downloading/caching cutouts...")
         prepared_rows = download_cutout_files_parallel(cutout_table, object_name, cfg, ra=ra, dec=dec)
@@ -3417,9 +3492,19 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
             print(f"SPHEREx data release inferred from cached file paths: {prepared_release.upper()}")
             set_runtime_data_release(cfg, prepared_release)
 
+    release = require_single_data_release(prepared_rows, cfg.data_release)
+    set_runtime_data_release(cfg, release)
+    if release == "qr3":
+        raise NotImplementedError(
+            "QR3 release and calibration discovery is supported, but QR3 extraction "
+            "requires the calibration/aperture and EPSF stages, which are not implemented yet."
+        )
+    cfg.output_dir = str(Path(cfg.output_dir) / release)
+    ensure_output_directories(cfg.output_dir)
     print("Opening cached cutouts...")
     cutouts = open_cutouts_parallel(prepared_rows, ra, dec, cfg)
     good_cutouts = [r for r in cutouts if "image_hdu" in r]
+    require_single_data_release(good_cutouts, release)
     opened_release = infer_unique_data_release(good_cutouts)
     if opened_release not in ("unknown", "mixed"):
         set_runtime_data_release(cfg, opened_release)
