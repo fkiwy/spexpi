@@ -1,6 +1,8 @@
 """Synthetic QR3 calibration and aperture extraction, without archive access."""
 import gzip
 import io
+import shutil
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,6 +84,43 @@ class QR3ApertureTests(unittest.TestCase):
             self.assertEqual(h[0].header['WAVESRC'],'CWAVE')
             self.assertEqual(h[0].header['SWCSCOLL'],'cal-swcs-v5-2026-191')
         self.assertEqual(self.cfg.output_dir,str(self.root/'out'))
+
+    def test_combined_pipeline_bins_measurements_and_preserves_release(self):
+        qr3_path, _ = self.make_cutout()
+        dr1_path = Path(self.cfg.download_dir) / 'dr1' / 'synthetic' / qr3_path.name
+        dr1_path.parent.mkdir(parents=True)
+        with fits.open(qr3_path) as hdul:
+            hdul[0].header['DATAREL'] = 'dr1'
+            hdul['IMAGE'].header['DATAREL'] = 'dr1'
+            hdul['VARIANCE'].data *= 4
+            hdul.writeto(dr1_path)
+        for base in (self.cfg.spectral_wcs_cache_dir, self.cfg.sapm_cache_dir):
+            shutil.copytree(Path(base) / 'qr3', Path(base) / 'dr1')
+        channels = Table({'DETECTOR': np.repeat(np.arange(1, 7), 2),
+                          'WAVELENGTH': np.tile([1.125, 1.25], 6)})
+        for release in ('dr1', 'qr3'):
+            path = p.get_spectral_channels_cache_dir(self.cfg, release) / 'channels.fits'
+            channels.write(path)
+        cfg = replace(self.cfg, data_release=None, combine_dr1_qr3=True, save_raw_measurements=False,
+                      reduce_oversampling=True, use_spectral_channels_for_binning=True,
+                      spectral_channels_bin_by='edges')
+
+        with patch.object(p, 'download_calibration', side_effect=AssertionError('network used')):
+            spectrum, measurements = p.run_spherex_pipeline(24.24, 9.56, 'synthetic', cfg)
+            self.assertEqual(len(spectrum), 1)
+            self.assertEqual(set(measurements['data_release']), {'dr1', 'qr3'})
+            weights = 1 / measurements['err'] ** 2
+            self.assertAlmostEqual(spectrum['FLUX'][0], np.average(measurements['flux'], weights=weights), places=12)
+            self.assertAlmostEqual(spectrum['ERR'][0], np.sqrt(1 / weights.sum()), places=12)
+            output = self.root / 'out' / 'dr1+qr3' / 'fits'
+            self.assertEqual(fits.getval(output / 'synthetic_aperture_spectrum.fits', 'DATAREL'), 'dr1+qr3')
+            raw = Table.read(output / 'synthetic_measurements.fits')
+            self.assertEqual(set(raw['data_release']), {'dr1', 'qr3'})
+
+            channels['WAVELENGTH'][0] += .01
+            channels.write(path, overwrite=True)
+            with self.assertRaisesRegex(ValueError, 'spectral-channel grids differ'):
+                p.run_spherex_pipeline(24.24, 9.56, 'synthetic', cfg)
 
     def test_pipeline_skips_off_detector_exposure_but_rejects_invalid_geometry(self):
         good_path, _ = self.make_cutout()

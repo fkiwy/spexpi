@@ -138,6 +138,31 @@ class ReleaseTests(unittest.TestCase):
                 get.assert_called_once()
             self.assertFalse(cfg.redownload_existing_files)
 
+    def test_combined_discovery_queries_each_release_with_its_own_cache_indices(self):
+        cfg = p.PipelineConfig(combine_dr1_qr3=True)
+
+        def query(ra, dec, release_cfg):
+            return Table({'uri': [f'{release_cfg.data_release}/level2/a.fits'], 'cutout_index': [1]})
+
+        def download(table, name, release_cfg, **kwargs):
+            self.assertEqual(list(table['cutout_index']), [1])
+            self.assertFalse(release_cfg.combine_dr1_qr3)
+            return [{'data_release': release_cfg.data_release, 'cutout_index': 1}]
+
+        with patch.object(p, 'query_spherex_cutouts', side_effect=query) as queries, \
+             patch.object(p, 'download_cutout_files_parallel', side_effect=download):
+            rows = p.prepare_combined_cutouts(1., 2., 'target', cfg)
+        self.assertEqual([call.args[2].data_release for call in queries.call_args_list], ['dr1', 'qr3'])
+        self.assertEqual([(row['data_release'], row['cutout_index']) for row in rows], [('dr1', 1), ('qr3', 2)])
+
+    def test_combined_mode_requires_both_releases_and_rejects_conflicting_selector(self):
+        with self.assertRaisesRegex(ValueError, 'requires data_release=None'):
+            p.validate_config(p.PipelineConfig(combine_dr1_qr3=True, data_release='dr1'))
+        with self.assertRaisesRegex(ValueError, 'both DR1 and QR3'):
+            p.require_combined_releases([{'data_release': 'dr1'}])
+        with self.assertRaisesRegex(ValueError, 'only cutouts'):
+            p.require_combined_releases([{'data_release': r} for r in ('dr1', 'qr3', 'qr2')])
+
     def test_query_guard_rejects_mixed_results_before_download(self):
         table = Table({'uri': ['qr2/a.fits', 'qr3/b.fits']})
         with patch.object(p, 'query_spherex_cutouts', return_value=table), \
