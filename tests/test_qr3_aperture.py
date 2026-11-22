@@ -83,6 +83,31 @@ class QR3ApertureTests(unittest.TestCase):
             self.assertEqual(h[0].header['SWCSCOLL'],'cal-swcs-v5-2026-191')
         self.assertEqual(self.cfg.output_dir,str(self.root/'out'))
 
+    def test_pipeline_skips_off_detector_exposure_but_rejects_invalid_geometry(self):
+        good_path, _ = self.make_cutout()
+        edge_path = good_path.with_name('edge.fits')
+        with fits.open(good_path) as hdul:
+            hdul['IMAGE'].header['CRPIX1A'] = 17.
+            hdul.writeto(edge_path)
+
+        with patch.object(p, 'download_calibration', side_effect=AssertionError('network used')), \
+             patch.object(p, 'append_manifest_rows') as manifest:
+            spectrum, measurements = p.run_spherex_pipeline(24.24, 9.56, 'synthetic', self.cfg)
+            self.assertEqual(len(spectrum), 1)
+            self.assertEqual(len(measurements), 1)
+            rows = manifest.call_args_list[0].args[0]
+            self.assertEqual({row['open_status'] for row in rows}, {'ok', 'skipped_outside_detector'})
+
+            good_path.unlink()
+            with self.assertRaisesRegex(RuntimeError, 'No usable QR3 cutouts'):
+                p.run_spherex_pipeline(24.24, 9.56, 'synthetic', self.cfg)
+
+            self.make_cutout()
+            with fits.open(edge_path, mode='update') as hdul:
+                del hdul['IMAGE'].header['CRPIX1A']
+            with self.assertRaisesRegex(RuntimeError, 'cutout/calibration preparation failed.*CRPIX'):
+                p.run_spherex_pipeline(24.24, 9.56, 'synthetic', self.cfg)
+
     def test_subpixel_mapping_mwir_orientation_and_memory_cache(self):
         for detector in (4,5,6):
             _,header=self.make_cutout(detector)

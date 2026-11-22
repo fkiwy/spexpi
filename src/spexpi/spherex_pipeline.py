@@ -1169,14 +1169,19 @@ def qr3_parent_coordinates(header, image_shape, parent_shape):
     return offsets
 
 
+class SourceOutsideDetectorError(ValueError):
+    """A finite source position falls outside the wavelength calibration grid."""
+
+
 def qr3_wavelength(header, image_shape, x, y, detector, cfg, release="qr3"):
     """Bilinearly sample full-resolution CWAVE and CBAND at the source position."""
     cwave, cband = load_spectral_wcs(detector, cfg, release)
     dx, dy = qr3_parent_coordinates(header, image_shape, cwave.shape)
     xp, yp = float(x) + dx, float(y) + dy
-    if not (np.isfinite(xp) and np.isfinite(yp) and 0 <= xp <= cwave.shape[1] - 1
-            and 0 <= yp <= cwave.shape[0] - 1):
-        raise ValueError("Source lies outside the full-resolution spectral WCS map.")
+    if not (np.isfinite(xp) and np.isfinite(yp)):
+        raise ValueError("Source position in the full-resolution spectral WCS map is nonfinite.")
+    if not (0 <= xp <= cwave.shape[1] - 1 and 0 <= yp <= cwave.shape[0] - 1):
+        raise SourceOutsideDetectorError("Source lies outside the full-resolution spectral WCS map.")
     values = [float(map_coordinates(m, [[yp], [xp]], order=1, mode="constant", cval=np.nan,
                                     prefilter=False)[0]) for m in (cwave, cband)]
     if not all(np.isfinite(v) and v > 0 for v in values):
@@ -1453,6 +1458,18 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                     "bandwidth_um": bandwidth_um,
                     "wavelength_source": "CWAVE" if release in EPSF_RELEASES else "WCS-WAVE",
                 }
+        except SourceOutsideDetectorError as exc:
+            return {
+                "uri": str(row.get("uri", open_path)),
+                "local_uri": str(open_path),
+                "data_release": release,
+                "cutout_index": int(row["cutout_index"]),
+                "detector": detector,
+                "x_src": float(x_src),
+                "y_src": float(y_src),
+                "status": "skipped_outside_detector",
+                "open_error": str(exc),
+            }
         except Exception as exc:
             last_exc = exc
             if attempt < cfg.retries - 1:
@@ -3819,9 +3836,18 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
     print("Opening cached cutouts...")
     cutouts = open_cutouts_parallel(prepared_rows, ra, dec, cfg)
     good_cutouts = [r for r in cutouts if "image_hdu" in r]
-    if release in EPSF_RELEASES and len(good_cutouts) != len(cutouts):
-        errors = [r.get("open_error", r.get("status", "unknown")) for r in cutouts if "image_hdu" not in r]
-        raise RuntimeError(f"{release.upper()} cutout/calibration preparation failed: {errors}")
+    if release in EPSF_RELEASES:
+        failed_cutouts = [
+            r for r in cutouts if "image_hdu" not in r and r.get("status") != "skipped_outside_detector"
+        ]
+        if failed_cutouts:
+            errors = [r.get("open_error", r.get("status", "unknown")) for r in failed_cutouts]
+            raise RuntimeError(f"{release.upper()} cutout/calibration preparation failed: {errors}")
+        skipped = len(cutouts) - len(good_cutouts)
+        if skipped:
+            print(f"Skipped {skipped} cutouts where the source lies outside the detector calibration grid.")
+            if not good_cutouts:
+                raise RuntimeError(f"No usable {release.upper()} cutouts: the source lies outside the detector calibration grid in all {skipped}.")
     require_single_data_release(good_cutouts, release)
     opened_release = infer_unique_data_release(good_cutouts)
     if opened_release not in ("unknown", "mixed"):
