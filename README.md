@@ -99,6 +99,11 @@ The HTTP mode is usually the fastest and most practical when IRSA is available b
 requested cutout. The S3 mode is useful as a fallback or for workflows where direct archive access is required, but it
 can be slower because remote FITS access may require reading large portions of the parent file.
 
+When the configuration includes proper motion and a reference epoch, the HTTP
+backend centers each cutout at the exposure epoch using the TAP time bounds.
+An online run refreshes older cached files when their request differs from the
+propagated cutout request. Cached-only runs use the files already on disk.
+
 ### 3. Data release handling
 
 Set `PipelineConfig(data_release="dr1")` for first-year spectral images

@@ -1,4 +1,5 @@
 """Release/provenance regression tests; no archive access required."""
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -104,6 +105,38 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(row['data_release'], release)
                     self.assertEqual(Path(row['local_uri']).parent, Path(d)/release/'target')
             self.assertNotEqual(paths[0], paths[1])
+
+    def test_http_cutout_recenter_refreshes_old_cache_then_reuses_it(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = p.PipelineConfig(
+                data_release='dr1', download_dir=directory, retries=1,
+                reference_epoch_yr=1998.87, pmra_masyr=2193, pmdec_masyr=527,
+            )
+            uri = 'https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/frame.fits?center=63.831432,-9.585187d&size=0.033333'
+            row = dict(uri=uri, cutout_index=1, time_bounds_lower=60922., time_bounds_upper=60922.1)
+            cache = p.get_object_download_dir(cfg, 'target')
+            path = cache / p.filename_from_uri(uri, 1)
+            fits.PrimaryHDU().writeto(path)
+            content = io.BytesIO()
+            fits.PrimaryHDU().writeto(content)
+
+            with patch.object(p.requests, 'get') as get:
+                get.return_value.__enter__.return_value.iter_content.return_value = [content.getvalue()]
+                received = p.prepare_cutout_row_file(row, cache, cfg, 63.831432, -9.585187)
+                self.assertEqual(received['download_status'], 'downloaded_http')
+                sent = get.call_args.args[0]
+                query = parse_qs(urlsplit(sent).query)
+                self.assertEqual(query['size'], ['0.033333'])
+                ra, dec, _ = p.project_to_epoch(63.831432, -9.585187, 1998.87, 2193, 527, 60922.05)
+                self.assertEqual(query['center'], [f'{ra:.9f},{dec:.9f}d'])
+                self.assertEqual(received['local_uri'], str(path))
+                self.assertEqual(fits.getval(path, 'DATAREL'), 'dr1')
+                self.assertEqual(p.prepare_cutout_row_file(row, cache, cfg, 63.831432, -9.585187)
+                                 ['download_status'], 'cached')
+                get.assert_called_once()
+            self.assertFalse(cfg.redownload_existing_files)
 
     def test_query_guard_rejects_mixed_results_before_download(self):
         table = Table({'uri': ['qr2/a.fits', 'qr3/b.fits']})

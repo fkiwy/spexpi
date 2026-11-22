@@ -95,6 +95,17 @@ class EPSFTests(unittest.TestCase):
         self.assertEqual(result['psf_status'],'ok')
         self.assertAlmostEqual(result['flux_uJy'],1000,delta=3.)
 
+    def test_psf_rejects_a_source_outside_the_cached_cutout(self):
+        path, ra, dec, _ = self.scene(-.25, 14.75)
+        row = p.process_cutout_row(
+            {'local_uri': str(path), 'data_release': 'qr3', 'cutout_index': 1}, ra, dec, self.cfg
+        )
+        self.cfg.enable_psf_local_grid_search = True
+        result = next(m for m in p.measure_cutout_photometry(row, {}, self.cfg)
+                      if m['photometry_method'] == 'psf')
+        self.assertEqual(result['psf_status'], 'outside_cutout')
+        self.assertFalse(np.isfinite(result['flux_uJy']))
+
     def test_parent_detector_clipping_keeps_epsf_and_source_aligned(self):
         path,ra,dec,source=self.scene(5.25,14.75)
         with fits.open(path,mode='update') as h:

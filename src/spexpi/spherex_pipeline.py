@@ -11,6 +11,7 @@ import threading
 import tempfile
 import urllib.parse
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -635,8 +636,10 @@ def download_uri_to_file_http(uri: str, local_path: Path, cfg: PipelineConfig) -
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     fh.write(chunk)
+    stamp_data_release_in_fits(tmp_path, infer_data_release_from_uri(uri))
+    with fits.open(tmp_path, mode="update", memmap=False) as hdul:
+        hdul[0].header["SPXREQID"] = (sha256(uri.encode()).hexdigest()[:16], "HTTP cutout request ID")
     tmp_path.replace(local_path)
-    stamp_data_release_in_fits(local_path, infer_data_release_from_uri(uri))
     return local_path
 
 
@@ -763,6 +766,36 @@ def download_uri_to_file(uri: str, local_path: Path, cfg: PipelineConfig, ra: fl
     return download_uri_to_file_http(uri, local_path, cfg)
 
 
+def recenter_http_cutout_uri(uri, row, cfg, ra, dec):
+    """Center an IRSA cutout at the target position for the exposure's epoch."""
+    if ra is None or dec is None or cfg.reference_epoch_yr is None or not (cfg.pmra_masyr or cfg.pmdec_masyr):
+        return uri
+    parsed = urllib.parse.urlsplit(uri)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if parsed.hostname != "irsa.ipac.caltech.edu" or "center" not in dict(query):
+        return uri
+    times = []
+    for name in ("time_bounds_lower", "time_bounds_upper"):
+        value = _row_value(row, name)
+        if value is not None and not np.ma.is_masked(value):
+            try:
+                mjd = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(mjd):
+                times.append(mjd)
+    if not times:
+        return uri
+    adj_ra, adj_dec, status = project_to_epoch(
+        ra, dec, cfg.reference_epoch_yr, cfg.pmra_masyr, cfg.pmdec_masyr, sum(times) / len(times)
+    )
+    if status != "astropy" and not status.startswith("manual_pm_fallback:"):
+        return uri
+    center = f"{adj_ra:.9f},{adj_dec:.9f}d"
+    query = [(key, center if key == "center" else value) for key, value in query]
+    return parsed._replace(query=urllib.parse.urlencode(query, safe=",")).geturl()
+
+
 def prepare_cutout_row_file(row, object_download_dir: Path, cfg: PipelineConfig, ra: float | None = None, dec: float | None = None) -> dict:
     """Ensure one cutout is available locally and return a row-like dict with local_uri."""
     uri = str(_row_value(row, "uri", ""))
@@ -778,11 +811,23 @@ def prepare_cutout_row_file(row, object_download_dir: Path, cfg: PipelineConfig,
     existed_before = local_file.exists() and local_file.stat().st_size > 0
     backend = str(getattr(cfg, "download_backend", "http") or "http").lower().strip()
 
+    download_cfg = cfg
+    if backend == "http":
+        centered_uri = recenter_http_cutout_uri(uri, row, cfg, ra, dec)
+        if existed_before and not cfg.redownload_existing_files and centered_uri != uri:
+            try:
+                request_id = fits.getval(local_file, "SPXREQID")
+            except (KeyError, OSError, ValueError):
+                request_id = None
+            if request_id != sha256(centered_uri.encode()).hexdigest()[:16]:
+                download_cfg = replace(cfg, redownload_existing_files=True)
+        uri = centered_uri
+
     last_exc = None
     for attempt in range(cfg.retries):
         try:
-            download_uri_to_file(uri, local_file, cfg, ra=ra, dec=dec)
-            if existed_before and not cfg.redownload_existing_files:
+            download_uri_to_file(uri, local_file, download_cfg, ra=ra, dec=dec)
+            if existed_before and not download_cfg.redownload_existing_files:
                 status = "cached"
             elif backend in ("s3", "s3_cutout"):
                 status = "downloaded_s3_cutout"
@@ -2166,6 +2211,8 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
     flux_uJy, err_uJy, info
     """
     detector = int(detector)
+    if "EPSF" in hdul_like and not (0 <= x < flux_ujy.shape[1] and 0 <= y < flux_ujy.shape[0]):
+        return np.nan, np.nan, {"psf_status": "outside_cutout"}
 
     if (not cfg.enable_psf_local_grid_search) or detector not in tuple(cfg.psf_grid_search_enabled_detectors):
         psf_kernel = extract_spherex_psf_kernel(hdul_like, x, y, cfg)
@@ -3902,6 +3949,9 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
         unbinned_plot_spec = process_spectrum_table(raw_spec, cfg, reduce_oversampling_override=False)
         final_spec = process_spectrum_table(raw_spec, cfg)
         final_specs[method] = final_spec
+        if len(final_spec) == 0:
+            logging.warning("No usable %s spectrum points for %s. Check the cutout and photometry diagnostics.",
+                            method, object_name)
         save_spectrum_fits(
             final_spec,
             ra,
