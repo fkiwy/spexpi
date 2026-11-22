@@ -112,9 +112,9 @@ applies to archive queries and cached runs. IRSA serves wide and deep DR1
 spectral images under the same `dr1/level2/` path. The DR1 All-Sky Cube uses
 a separate workflow. With `data_release=None`, every input must have identifiable,
 consistent provenance. Unknown releases, conflicting FITS/path metadata, and mixed
-release batches raise errors rather than falling back to QR2. Supported release
-identifiers are `dr1`, `qr3`, `qr2`, `qr2_deep`, and `qr1`. Run DR1 and
-QR3 separately. QR2 is a legacy cached or direct-download workflow. IRSA
+release batches raise errors by default. Supported release identifiers are
+`dr1`, `qr3`, `qr2`, `qr2_deep`, and `qr1`. QR2 is a legacy cached or
+direct-download workflow. IRSA
 documents direct download availability through February 2027.
 
 **DR1 and QR3 support aperture and ePSF extraction.** Choose
@@ -202,6 +202,37 @@ collection IDs and use separate archive prefixes and local caches.
 See [DR1 validation](validation/DR1.md) for the six-detector sample and
 reproduction commands, and [stage-four validation](validation/QR3_STAGE4.md)
 for the historical QR2/QR3 comparison.
+
+#### Combine DR1 and QR3 spectral measurements
+
+Use `combine_dr1_qr3=True` with `data_release=None` to extract one spectrum
+per requested photometry method across both releases.
+
+```python
+cfg = PipelineConfig(
+    combine_dr1_qr3=True,
+    photometry_method="both",
+    use_spectral_channels_for_binning=True,
+    spectral_channels_bin_by="edges",
+)
+spectra, measurements = run_spherex_pipeline(ra, dec, object_name, cfg)
+```
+
+Online runs query the two releases separately. With
+`query_irsa_for_cutouts=False`, the pipeline reads the existing
+`download_dir/dr1/<object_name>/` and `download_dir/qr3/<object_name>/`
+caches. Both releases must supply usable cutouts. Each exposure uses
+its own release's calibrations, and joint channel binning checks that
+both releases define identical channel edges and centers. The example
+uses inverse-variance weighting within each channel. With
+`remove_outliers=True`, the pipeline clips each release separately before
+combining the surviving measurements.
+
+Products go under `output_dir/dr1+qr3/`. Spectrum FITS headers record
+`DATAREL=dr1+qr3`, and the measurements FITS table is always saved in
+this mode with the release of each exposure. QR2 stays a separate
+workflow. Joint binning averages observations across survey epochs. Use
+standalone extraction to study temporal variability.
 
 Run the release regression tests with:
 

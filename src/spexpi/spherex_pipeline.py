@@ -10,7 +10,7 @@ import time
 import threading
 import tempfile
 import urllib.parse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -79,6 +79,9 @@ class PipelineConfig:
     # ------------------------------------------------------------------
     data_release: str | None = None
     """Select qr1, qr2, qr2_deep, qr3 or dr1; None requires unambiguous input provenance."""
+
+    combine_dr1_qr3: bool = field(default=False, kw_only=True)
+    """Query or read both DR1 and QR3 and combine their measurements into one spectrum per method."""
 
     tap_url: str = "https://irsa.ipac.caltech.edu/TAP"
     """IRSA TAP service URL used to discover SPHEREx image artifacts."""
@@ -404,6 +407,8 @@ def validate_config(cfg: PipelineConfig) -> None:
         raise ValueError("allow_source_background_fallback must be bool or None")
     if cfg.aperture_masked_policy not in (None, "reject", "allow"):
         raise ValueError("aperture_masked_policy must be reject or allow")
+    if cfg.combine_dr1_qr3 and cfg.data_release is not None:
+        raise ValueError("combine_dr1_qr3 requires data_release=None.")
     if cfg.data_release is not None and normalize_data_release(cfg.data_release) == "unknown":
         raise ValueError(f"Unsupported SPHEREx data_release={cfg.data_release!r}.")
     backend = str(cfg.download_backend).lower().strip()
@@ -1052,11 +1057,14 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
 
     The filename order is used as the cutout order.
     """
-    object_download_dir = get_object_download_dir(cfg, object_name)
-    directories = {object_download_dir, Path(cfg.download_dir) / safe_filename(object_name)}
-    if cfg.data_release is None:
-        directories.update(Path(cfg.download_dir) / release / safe_filename(object_name)
-                           for release in RELEASE_CALIBRATIONS)
+    object_dir_name = safe_filename(object_name)
+    if cfg.combine_dr1_qr3:
+        directories = {Path(cfg.download_dir) / release / object_dir_name for release in EPSF_RELEASES}
+    else:
+        directories = {get_object_download_dir(cfg, object_name), Path(cfg.download_dir) / object_dir_name}
+        if cfg.data_release is None:
+            directories.update(Path(cfg.download_dir) / release / object_dir_name
+                               for release in RELEASE_CALIBRATIONS)
     files = sorted({p for directory in directories for p in directory.glob(cfg.cached_cutout_glob)
                     if p.is_file() and not p.name.endswith(".part")})
 
@@ -1430,7 +1438,6 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                 if data_release == "unknown":
                     data_release = infer_data_release_from_uri(str(open_path))
                 if data_release != "unknown":
-                    set_runtime_data_release(cfg, data_release)
                     # Back-fill DATAREL into older cached FITS files when the
                     # release was inferred from the path/row but missing in
                     # the header. This makes future cached runs self-contained.
@@ -2717,6 +2724,10 @@ def load_spectral_channels_calibration(cfg: PipelineConfig, data_release: str | 
 
     Returns an astropy Table when possible, otherwise None.
     """
+    if data_release is None and cfg.combine_dr1_qr3:
+        if not hasattr(cfg, "_combined_channels"):
+            cfg._combined_channels = load_combined_spectral_channels(cfg)
+        return cfg._combined_channels
     release = (normalize_data_release(data_release) if data_release is not None
                else get_runtime_data_release(cfg))
     if release == "unknown":
@@ -3214,7 +3225,13 @@ def reduce_oversampling_per_detector(wl, flux, err, det):
     return tuple(map(np.array, out))
 
 
-def build_spectrum_table(measurements: list[dict], aperture_radius_pix: float | Mapping[int, float] | None, photometry_method: str = "aperture") -> Table:
+def build_spectrum_table(
+    measurements: list[dict],
+    aperture_radius_pix: float | Mapping[int, float] | None,
+    photometry_method: str = "aperture",
+    *,
+    include_release: bool = False,
+) -> Table:
     """Select valid measurements and return a wavelength-sorted raw spectrum table.
 
     For aperture spectra, ``aperture_radius_pix`` may be either a single radius
@@ -3238,7 +3255,10 @@ def build_spectrum_table(measurements: list[dict], aperture_radius_pix: float | 
     err = np.array([r["err"] for r in rows])
     det = np.array([r["detector"] for r in rows])
     order = np.argsort(wl)
-    return Table([wl[order], flux[order], err[order], det[order]], names=("WAVELENGTH", "FLUX", "ERR", "DETECTOR"))
+    spec = Table([wl[order], flux[order], err[order], det[order]], names=("WAVELENGTH", "FLUX", "ERR", "DETECTOR"))
+    if include_release:
+        spec["DATAREL"] = np.asarray([r["data_release"] for r in rows])[order]
+    return spec
 
 
 def process_spectrum_table(spec: Table, cfg: PipelineConfig, reduce_oversampling_override: bool | None = None) -> Table:
@@ -3252,15 +3272,33 @@ def process_spectrum_table(spec: Table, cfg: PipelineConfig, reduce_oversampling
     if len(spec) == 0:
         return spec
     wl, flux, err, det = [np.asarray(spec[name]) for name in ("WAVELENGTH", "FLUX", "ERR", "DETECTOR")]
+    keep = np.ones(len(spec), dtype=bool)
     if cfg.clip_flux_at_wavelength is not None:
-        keep = wl >= float(cfg.clip_flux_at_wavelength)
-        wl, flux, err, det = wl[keep], flux[keep], err[keep], det[keep]
+        keep &= wl >= float(cfg.clip_flux_at_wavelength)
     if cfg.sanitize_flux:
         # Keep negative fluxes, but remove non-finite values, zero placeholders, and invalid uncertainties.
-        good = np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err > 0) & (flux != 0)
-        wl, flux, err, det = wl[good], flux[good], err[good], det[good]
+        keep &= np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err > 0) & (flux != 0)
+    wl, flux, err, det = wl[keep], flux[keep], err[keep], det[keep]
     if cfg.remove_outliers:
-        wl, flux, err, det = remove_outliers_per_detector(wl, flux, err, det, cfg.outlier_detectors, cfg.outlier_nbr_of_bins, cfg.outlier_sigma)
+        settings = (cfg.outlier_detectors, cfg.outlier_nbr_of_bins, cfg.outlier_sigma)
+        if cfg.combine_dr1_qr3:
+            releases = np.asarray(spec["DATAREL"])[keep]
+            # Coarse detector bins can sample different parts of a spectral feature
+            # in each release. Use each release's own MAD before joint binning.
+            clipped = []
+            for release in np.unique(releases):
+                mask = releases == release
+                if release not in EPSF_RELEASES:
+                    raise ValueError(f"Unexpected spectrum measurement release: {release}")
+                result = remove_outliers_per_detector(wl[mask], flux[mask], err[mask], det[mask], *settings)
+                if len(result[0]):
+                    clipped.append(result)
+            if clipped:
+                wl, flux, err, det = (np.concatenate(values) for values in zip(*clipped))
+            else:
+                wl, flux, err, det = wl[:0], flux[:0], err[:0], det[:0]
+        else:
+            wl, flux, err, det = remove_outliers_per_detector(wl, flux, err, det, *settings)
 
     do_reduce_oversampling = cfg.reduce_oversampling if reduce_oversampling_override is None else bool(reduce_oversampling_override)
     if do_reduce_oversampling:
@@ -3449,7 +3487,9 @@ def save_spectrum_fits(
     hdu0 = fits.PrimaryHDU()
     hdu0.header["TELESCOP"] = "SPHEREx"
     data_release = get_runtime_data_release(cfg)
-    if data_release != "unknown":
+    if cfg.combine_dr1_qr3:
+        hdu0.header["DATAREL"] = ("dr1+qr3", "Combined DR1 and QR3 extraction")
+    elif data_release != "unknown":
         hdu0.header["DATAREL"] = data_release
     if data_release != "unknown":
         hdu0.header["SAPMCOLL"] = calibration_collection(cfg, data_release, "sapm")
@@ -3836,6 +3876,66 @@ def plot_spectrum(
     print(f"Saved {method} plot: {out}")
 
 
+def prepare_pipeline_cutouts(ra, dec, object_name, cfg):
+    if not cfg.query_irsa_for_cutouts:
+        print("Skipping IRSA query; using locally cached cutouts...")
+        rows = prepare_cached_cutout_rows(object_name, cfg)
+        print(f"Found {len(rows)} cached cutouts")
+        return rows
+
+    require_supported_photometry(normalize_data_release(cfg.data_release), cfg)
+    print("Querying SPHEREx cutouts...")
+    cutout_table = query_spherex_cutouts(ra, dec, cfg)
+    print(f"Found {len(cutout_table)} cutouts")
+    query_release = require_single_data_release([
+        {"data_release": infer_data_release_from_uri(str(row["uri"]))}
+        for row in cutout_table
+    ], cfg.data_release)
+    set_runtime_data_release(cfg, query_release)
+
+    print("Downloading/caching cutouts...")
+    rows = download_cutout_files_parallel(cutout_table, object_name, cfg, ra=ra, dec=dec)
+    n_cached = sum(r.get("download_status") == "cached" for r in rows)
+    n_failed = sum(str(r.get("download_status", "")).startswith("download_failed") for r in rows)
+    print(f"Prepared {len(rows)} files ({n_cached} reused from cache, {n_failed} failed)")
+    return rows
+
+
+def require_combined_releases(rows):
+    releases = {normalize_data_release(row.get("data_release")) for row in rows}
+    if not releases <= EPSF_RELEASES:
+        raise ValueError("Combined extraction accepts only cutouts with DR1 or QR3 provenance.")
+    if releases != EPSF_RELEASES:
+        raise ValueError("Combined extraction requires usable cutouts from both DR1 and QR3.")
+
+
+def prepare_combined_cutouts(ra, dec, object_name, cfg):
+    if cfg.query_irsa_for_cutouts:
+        rows = []
+        for release in sorted(EPSF_RELEASES):
+            release_cfg = replace(cfg, data_release=release, combine_dr1_qr3=False)
+            rows.extend(prepare_pipeline_cutouts(ra, dec, object_name, release_cfg))
+        # Download indices stay release-specific for existing cache filenames.
+        # Once files are selected, use unique indices for joint manifests.
+        rows = [dict(row, cutout_index=index) for index, row in enumerate(rows, start=1)]
+    else:
+        rows = prepare_pipeline_cutouts(ra, dec, object_name, cfg)
+    require_combined_releases(rows)
+    return rows
+
+
+def load_combined_spectral_channels(cfg):
+    dr1 = load_spectral_channels_calibration(cfg, "dr1")
+    qr3 = load_spectral_channels_calibration(cfg, "qr3")
+    for detector in range(1, 7):
+        dr1_grid = spectral_channel_edges_for_detector(dr1, detector)
+        qr3_grid = spectral_channel_edges_for_detector(qr3, detector)
+        if any(a is None or b is None or not np.array_equal(a, b)
+               for a, b in zip(dr1_grid, qr3_grid)):
+            raise ValueError(f"DR1 and QR3 spectral-channel grids differ or are missing for D{detector}.")
+    return dr1
+
+
 def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, cfg: PipelineConfig | None = None):
     """Run the full SPHEREx extraction workflow and return the processed spectrum table."""
     if cfg is None:
@@ -3846,39 +3946,15 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
         set_runtime_data_release(cfg, cfg.data_release)
     object_name = make_object_name(ra, dec, object_name)
 
-    if cfg.query_irsa_for_cutouts:
-        require_supported_photometry(normalize_data_release(cfg.data_release), cfg)
-        print("Querying SPHEREx cutouts...")
-        cutout_table = query_spherex_cutouts(ra, dec, cfg)
-        print(f"Found {len(cutout_table)} cutouts")
-        query_release = require_single_data_release([
-            {"data_release": infer_data_release_from_uri(str(row["uri"]))}
-            for row in cutout_table
-        ], cfg.data_release)
-        require_supported_photometry(query_release, cfg)
-        set_runtime_data_release(cfg, query_release)
-
-        print("Downloading/caching cutouts...")
-        prepared_rows = download_cutout_files_parallel(cutout_table, object_name, cfg, ra=ra, dec=dec)
-        n_cached = sum(1 for r in prepared_rows if r.get("download_status") == "cached")
-        n_failed = sum(1 for r in prepared_rows if str(r.get("download_status", "")).startswith("download_failed"))
-        print(f"Prepared {len(prepared_rows)} files ({n_cached} reused from cache, {n_failed} failed)")
-        prepared_release = infer_unique_data_release(prepared_rows)
-        if prepared_release not in ("unknown", "mixed"):
-            set_runtime_data_release(cfg, prepared_release)
+    if cfg.combine_dr1_qr3:
+        prepared_rows = prepare_combined_cutouts(ra, dec, object_name, cfg)
+        release = "dr1"  # Both releases use the same science policies and collection IDs.
     else:
-        print("Skipping IRSA query; using locally cached cutouts...")
-        prepared_rows = prepare_cached_cutout_rows(object_name, cfg)
-        print(f"Found {len(prepared_rows)} cached cutout files in {get_object_download_dir(cfg, object_name)}")
-        prepared_release = infer_unique_data_release(prepared_rows)
-        if prepared_release not in ("unknown", "mixed"):
-            print(f"SPHEREx data release inferred from cached file paths: {prepared_release.upper()}")
-            set_runtime_data_release(cfg, prepared_release)
-
-    release = require_single_data_release(prepared_rows, cfg.data_release)
+        prepared_rows = prepare_pipeline_cutouts(ra, dec, object_name, cfg)
+        release = require_single_data_release(prepared_rows, cfg.data_release)
     set_runtime_data_release(cfg, release)
     require_supported_photometry(release, cfg)
-    cfg.output_dir = str(Path(cfg.output_dir) / release)
+    cfg.output_dir = str(Path(cfg.output_dir) / ("dr1+qr3" if cfg.combine_dr1_qr3 else release))
     ensure_output_directories(cfg.output_dir)
     print("Opening cached cutouts...")
     cutouts = open_cutouts_parallel(prepared_rows, ra, dec, cfg)
@@ -3895,15 +3971,15 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
             print(f"Skipped {skipped} cutouts where the source lies outside the detector calibration grid.")
             if not good_cutouts:
                 raise RuntimeError(f"No usable {release.upper()} cutouts: the source lies outside the detector calibration grid in all {skipped}.")
-    require_single_data_release(good_cutouts, release)
-    opened_release = infer_unique_data_release(good_cutouts)
-    if opened_release not in ("unknown", "mixed"):
-        set_runtime_data_release(cfg, opened_release)
-        print(f"SPHEREx data release used for calibration lookup: {opened_release.upper()}")
-    elif opened_release == "mixed":
-        print("WARNING: mixed SPHEREx data releases detected; calibration lookup will use per-cutout releases where possible.")
+    if cfg.combine_dr1_qr3:
+        require_combined_releases(good_cutouts)
+        if cfg.use_spectral_channels_for_binning and (
+            cfg.reduce_oversampling or (cfg.plot_spectrum and cfg.plot_spectral_channel_overlay)
+        ):
+            load_spectral_channels_calibration(cfg)
     else:
-        print("WARNING: could not infer SPHEREx data release from opened cutouts.")
+        require_single_data_release(good_cutouts, release)
+        print(f"SPHEREx data release used for calibration lookup: {release.upper()}")
     print(f"Opened {len(good_cutouts)} usable cutouts")
 
     cfg._epsf_references = sorted({r["epsf_reference"] for r in good_cutouts if r.get("epsf_reference")})
@@ -3923,7 +3999,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
     for row in good_cutouts:
         measurements.extend(measure_cutout_photometry(row, sapm_cache, cfg))
 
-    if cfg.save_raw_measurements:
+    if cfg.save_raw_measurements or cfg.combine_dr1_qr3:
         save_measurements_fits(measurements, object_name, cfg)
 
     append_manifest_rows(measurements, object_name, cfg, basename="measurement_manifest")
@@ -3943,6 +4019,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
             measurements,
             selected_aperture,
             photometry_method=method,
+            include_release=cfg.combine_dr1_qr3 and cfg.remove_outliers,
         )
         # This is the true unbinned comparison layer: same clipping/sanitation/outlier
         # handling as the final spectrum, but explicitly before oversampling reduction.

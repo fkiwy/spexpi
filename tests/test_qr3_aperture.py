@@ -1,6 +1,8 @@
 """Synthetic QR3 calibration and aperture extraction, without archive access."""
 import gzip
 import io
+import shutil
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,6 +84,62 @@ class QR3ApertureTests(unittest.TestCase):
             self.assertEqual(h[0].header['WAVESRC'],'CWAVE')
             self.assertEqual(h[0].header['SWCSCOLL'],'cal-swcs-v5-2026-191')
         self.assertEqual(self.cfg.output_dir,str(self.root/'out'))
+
+    def test_combined_pipeline_bins_measurements_and_preserves_release(self):
+        qr3_path, _ = self.make_cutout()
+        dr1_path = Path(self.cfg.download_dir) / 'dr1' / 'synthetic' / qr3_path.name
+        dr1_path.parent.mkdir(parents=True)
+        with fits.open(qr3_path) as hdul:
+            hdul[0].header['DATAREL'] = 'dr1'
+            hdul['IMAGE'].header['DATAREL'] = 'dr1'
+            hdul['VARIANCE'].data *= 4
+            hdul.writeto(dr1_path)
+        for base in (self.cfg.spectral_wcs_cache_dir, self.cfg.sapm_cache_dir):
+            shutil.copytree(Path(base) / 'qr3', Path(base) / 'dr1')
+        channels = Table({'DETECTOR': np.repeat(np.arange(1, 7), 2),
+                          'WAVELENGTH': np.tile([1.125, 1.25], 6)})
+        for release in ('dr1', 'qr3'):
+            path = p.get_spectral_channels_cache_dir(self.cfg, release) / 'channels.fits'
+            channels.write(path)
+        cfg = replace(self.cfg, data_release=None, combine_dr1_qr3=True, save_raw_measurements=False,
+                      reduce_oversampling=True, use_spectral_channels_for_binning=True,
+                      spectral_channels_bin_by='edges', remove_outliers=True, outlier_detectors=(4,))
+
+        with patch.object(p, 'download_calibration', side_effect=AssertionError('network used')):
+            spectrum, measurements = p.run_spherex_pipeline(24.24, 9.56, 'synthetic', cfg)
+            self.assertEqual(len(spectrum), 1)
+            self.assertEqual(set(measurements['data_release']), {'dr1', 'qr3'})
+            weights = 1 / measurements['err'] ** 2
+            self.assertAlmostEqual(spectrum['FLUX'][0], np.average(measurements['flux'], weights=weights), places=12)
+            self.assertAlmostEqual(spectrum['ERR'][0], np.sqrt(1 / weights.sum()), places=12)
+            output = self.root / 'out' / 'dr1+qr3' / 'fits'
+            self.assertEqual(fits.getval(output / 'synthetic_aperture_spectrum.fits', 'DATAREL'), 'dr1+qr3')
+            raw = Table.read(output / 'synthetic_measurements.fits')
+            self.assertEqual(set(raw['data_release']), {'dr1', 'qr3'})
+
+            channels['WAVELENGTH'][0] += .01
+            channels.write(path, overwrite=True)
+            with self.assertRaisesRegex(ValueError, 'spectral-channel grids differ'):
+                p.run_spherex_pipeline(24.24, 9.56, 'synthetic', cfg)
+
+    def test_combined_outlier_filter_preserves_sparse_d4_feature(self):
+        dr1 = Table({'WAVELENGTH': [3.49, 3.50, 3.51, 3.52, 3.53],
+                     'FLUX': [.10, .11, .10, .12, .11], 'ERR': [.01] * 5, 'DETECTOR': [4] * 5})
+        qr3 = Table({'WAVELENGTH': [3.55, 3.56, 3.57],
+                     'FLUX': [.39, .40, 2.0], 'ERR': [.01] * 3, 'DETECTOR': [4] * 3})
+        rows = [dict(wavelength=row['WAVELENGTH'], flux=row['FLUX'], err=row['ERR'],
+                     detector=4, photometry_method='aperture', aperture_radius_pix=2.,
+                     status='ok', data_release=release)
+                for release, table in [('dr1', dr1), ('qr3', qr3)] for row in table]
+        cfg = p.PipelineConfig(remove_outliers=True, reduce_oversampling=False)
+        spec = p.build_spectrum_table(rows, 2., include_release=True)
+        pooled = p.process_spectrum_table(spec, cfg)
+        separate = p.process_spectrum_table(spec, replace(cfg, combine_dr1_qr3=True))
+        self.assertEqual(len(pooled), 5)
+        expected = np.concatenate([p.process_spectrum_table(table, cfg)['WAVELENGTH']
+                                   for table in (dr1, qr3)])
+        np.testing.assert_array_equal(separate['WAVELENGTH'], expected)
+        self.assertEqual(len(separate), 7)
 
     def test_pipeline_skips_off_detector_exposure_but_rejects_invalid_geometry(self):
         good_path, _ = self.make_cutout()
