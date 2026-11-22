@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -14,6 +15,7 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 import requests
 
@@ -132,35 +134,52 @@ def write_preview(preview: CubePreview, output: Path) -> None:
     table = preview.spectrum
     output.parent.mkdir(parents=True, exist_ok=True)
     table.write(output.with_suffix(".ecsv"), overwrite=True)
-    figure = plt.figure(figsize=(11, 5), layout="constrained")
+    font = "Arial"
     try:
-        grid = figure.add_gridspec(2, 2, height_ratios=(3, 1))
-        ax = figure.add_subplot(grid[0, 0])
-        coverage = figure.add_subplot(grid[1, 0], sharex=ax)
-        field = figure.add_subplot(grid[:, 1], projection=preview.field_wcs)
-        wave = table["wavelength"]
-        brightness = table["surface_brightness"]
-        valid_brightness = np.where(table["valid"], brightness, np.nan)
-        ax.plot(wave, valid_brightness, marker=".", markersize=3)
-        if "uncertainty" in table.colnames:
-            ax.errorbar(wave, valid_brightness, yerr=table["uncertainty"], fmt="none", alpha=0.3)
-        ax.axvline(preview.field_wavelength, color="0.5", linestyle=":")
-        ax.set_ylabel(f"Surface brightness ({brightness.unit})")
-        ax.tick_params(labelbottom=False)
-        coverage.step(wave, table["nhits"], where="mid")
-        coverage.set(xlabel="Wavelength (µm)", ylabel="Hits")
-        finite = preview.field[np.isfinite(preview.field)]
-        limits = dict(zip(("vmin", "vmax"), np.percentile(finite, [2, 98]))) if finite.size else {}
-        rendered = field.imshow(preview.field, origin="lower", cmap="gray", **limits)
-        field.plot(*preview.marker, marker="+", color="tab:red", markersize=12)
-        field.set_title(f"{preview.field_wavelength:.3f} µm")
-        field.coords[0].set_axislabel("RA (ICRS)")
-        field.coords[1].set_axislabel("Dec (ICRS)")
-        figure.colorbar(rendered, ax=field, label=str(brightness.unit))
-        figure.suptitle(f"SPHEREx DR1 cube at ({table.meta['ra_deg']:.6f}°, {table.meta['dec_deg']:.6f}°)")
-        figure.savefig(output.with_suffix(".png"), dpi=160)
-    finally:
-        plt.close(figure)
+        font_manager.findfont(font, fallback_to_default=False)
+    except ValueError:
+        font = "DejaVu Sans"
+        logging.warning("Arial is unavailable. Using DejaVu Sans for this PDF.")
+
+    with plt.rc_context({
+        "font.family": font,
+        "mathtext.fontset": "custom",
+        "mathtext.rm": font,
+        "mathtext.it": f"{font}:italic",
+        "mathtext.bf": f"{font}:bold",
+        "mathtext.sf": font,
+        "mathtext.cal": font,
+        "pdf.fonttype": 42,
+    }):
+        figure = plt.figure(figsize=(11, 5), layout="constrained")
+        try:
+            grid = figure.add_gridspec(2, 2, height_ratios=(3, 1))
+            ax = figure.add_subplot(grid[0, 0])
+            coverage = figure.add_subplot(grid[1, 0], sharex=ax)
+            field = figure.add_subplot(grid[:, 1], projection=preview.field_wcs)
+            wave = table["wavelength"]
+            brightness = table["surface_brightness"]
+            valid_brightness = np.where(table["valid"], brightness, np.nan)
+            ax.plot(wave, valid_brightness, marker=".", markersize=3)
+            if "uncertainty" in table.colnames:
+                ax.errorbar(wave, valid_brightness, yerr=table["uncertainty"], fmt="none", alpha=0.3)
+            ax.axvline(preview.field_wavelength, color="0.5", linestyle=":")
+            ax.set_ylabel(f"Surface brightness ({brightness.unit})")
+            ax.tick_params(labelbottom=False)
+            coverage.step(wave, table["nhits"], where="mid")
+            coverage.set(xlabel="Wavelength (µm)", ylabel="Hits")
+            finite = preview.field[np.isfinite(preview.field)]
+            limits = dict(zip(("vmin", "vmax"), np.percentile(finite, [2, 98]))) if finite.size else {}
+            rendered = field.imshow(preview.field, origin="lower", cmap="gray", **limits)
+            field.plot(*preview.marker, marker="+", color="tab:red", markersize=12)
+            field.set_title(f"{preview.field_wavelength:.3f} µm")
+            field.coords[0].set_axislabel("RA (ICRS)")
+            field.coords[1].set_axislabel("Dec (ICRS)")
+            figure.colorbar(rendered, ax=field, label=str(brightness.unit))
+            figure.suptitle(f"SPHEREx DR1 cube at ({table.meta['ra_deg']:.6f}°, {table.meta['dec_deg']:.6f}°)")
+            figure.savefig(output.with_suffix(".pdf"), dpi=160)
+        finally:
+            plt.close(figure)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -194,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         write_preview(preview, args.output)
     except (ValueError, OSError, KeyError, requests.RequestException) as exc:
         parser.exit(1, f"Cube preview failed: {exc}\n")
-    print(f"Saved {args.output.with_suffix('.ecsv')} and {args.output.with_suffix('.png')}")
+    print(f"Saved {args.output.with_suffix('.ecsv')} and {args.output.with_suffix('.pdf')}")
     return 0
 
 

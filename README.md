@@ -217,7 +217,8 @@ The command finds the covering tile through IRSA and caches it in
 Use `--cache-dir` to set the cache location or `--tile path/to/tile.fits`
 to preview a known local tile offline.
 
-The PNG shows the target pixel's spectrum and channel hit counts next to
+The PDF uses Arial when installed and DejaVu Sans otherwise. It shows the
+target pixel's spectrum and channel hit counts next to
 a field image at the closest cube wavelength. The marker shows the input
 position. The field is clipped at the tile boundary. The ECSV contains the
 102 channel samples, hit counts, flags, and a validity column. DR1 tiles
