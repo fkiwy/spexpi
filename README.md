@@ -33,6 +33,7 @@ FITS spectra and diagnostic plots.
 - [Outputs](#outputs)
 - [Complete API documentation](#complete-api-documentation)
 - [Configuration reference](#configuration-reference)
+- [Migrating an existing QR2 workflow](#migrating-an-existing-qr2-workflow)
 - [Recommended workflow](#recommended-workflow)
 - [Troubleshooting](#troubleshooting)
 - [Acknowledgements](#acknowledgements)
@@ -86,7 +87,8 @@ The pipeline supports two input modes:
 
 - `query_irsa_for_cutouts=True`: query IRSA TAP, download or extract cutouts, and cache them locally.
 - `query_irsa_for_cutouts=False`: skip the IRSA query and read already cached FITS files from
-  `download_dir/<object_name>/`.
+  `download_dir/<release>/<object_name>/` (legacy object-only caches remain readable
+  when their release is known).
 
 Downloads can use:
 
@@ -97,22 +99,115 @@ The HTTP mode is usually the fastest and most practical when IRSA is available b
 requested cutout. The S3 mode is useful as a fallback or for workflows where direct archive access is required, but it
 can be slower because remote FITS access may require reading large portions of the parent file.
 
+When the configuration includes proper motion and a reference epoch, the HTTP
+backend centers each cutout at the exposure epoch using the TAP time bounds.
+An online run refreshes older cached files when their request differs from the
+propagated cutout request. Cached-only runs use the files already on disk.
+
 ### 3. Data release handling
 
-The pipeline is designed to be release-aware without requiring a user-facing `data_release` parameter. It attempts to
-infer the release from:
+Set `PipelineConfig(data_release="dr1")` for first-year spectral images
+(Surveys 1 and 2) or `data_release="qr3"` for Surveys 3 and 4. The selector
+applies to archive queries and cached runs. IRSA serves wide and deep DR1
+spectral images under the same `dr1/level2/` path. The DR1 All-Sky Cube uses
+a separate workflow. With `data_release=None`, every input must have identifiable,
+consistent provenance. Unknown releases, conflicting FITS/path metadata, and mixed
+release batches raise errors rather than falling back to QR2. Supported release
+identifiers are `dr1`, `qr3`, `qr2`, `qr2_deep`, and `qr1`. Run DR1 and
+QR3 separately. QR2 is a legacy cached or direct-download workflow. IRSA
+documents direct download availability through February 2027.
 
-1. the original IRSA URL or S3 key;
-2. the local cached file path;
-3. FITS header keywords such as `DATAREL`, `OBS_COLLECTION`, `COLLECTION`, or related variants.
+**DR1 and QR3 support aperture and ePSF extraction.** Choose
+`photometry_method="aperture"`, `"psf"`, or `"both"`. DR1 and QR3 PSF fitting
+uses the embedded `EPSF` binary table; QR2 retains its optical `PSF` cube path.
+The `"both"` mode writes independent aperture and PSF spectra.
 
-When possible, downloaded FITS files are stamped with:
+DR1 and QR3 wavelengths and bandwidths are sampled bilinearly from full-resolution
+`CWAVE`/`CBAND` calibration maps (`cal-swcs-v5-2026-191` by default), rather than
+from the approximate image spectral WCS. Both wavelength and pixel-area maps use
+sky detector coordinates: detectors 4–6 are already oriented correctly and are
+not flipped again. Cutout offsets must identify the parent-detector pixels;
+missing or unsupported geometry raises an error. The maps are shared between
+cutout workers and loaded once per detector per run.
 
-```text
-DATAREL = <release>
+```python
+cfg = PipelineConfig(
+    data_release="dr1",
+    photometry_method="both",
+    spectral_wcs_cache_dir="../resources/spherex_calibration_files/spectral_wcs",
+    # Leave collection overrides unset to select release-specific calibrations.
+)
 ```
 
-This makes cached runs self-contained even when the original URL is no longer available.
+The official spectral-channel table's `SUBCHAN`, `WL_MIN`, and `WL_MAX` columns
+are recognized, and its published `WAVELENGTH` centers are retained. Adjacent
+`WL_MIN`/`WL_MAX` envelopes overlap slightly; shared bin boundaries are placed at
+the midpoint between the preceding upper and following lower limits, with the
+outer limits retained. These are wavelength bins, not a replacement for the
+geometrical channel map. This parsing correction also applies to QR2 tables, so
+rebinned results can differ slightly from older runs that inferred edges solely
+from centers. DR1 and QR3 calibration failures raise errors. If a sparse
+spectrum cannot be integrated into channels, the measured unbinned points are
+retained with a warning.
+
+DR1 and QR3 ePSF fitting follows [IRSA's native-pixel rendering recipe](https://github.com/Caltech-IPAC/irsa-tutorials/blob/main/tutorials/spherex/spherex_psf.md).
+It selects the nearest zone center using parent-detector `XCENTER`/`YCENTER`,
+checks zone coverage, and reads `OVSMPX`/`OVSMPY`. It supports rectangular grids
+(including detector 3's 11 × 41 zones) and arbitrary table row ordering. Both the
+image and model must use sky detector coordinates.
+
+The ePSF is evaluated with Photutils `ImagePSF` at native pixel centers for each
+trial centroid. It is normalized over its full native support before restricting
+the fitting window or masking/clipping pixels; it is not block-summed or
+renormalized to the surviving pixels. This yields flux in the finite calibrated
+model's normalization, without extrapolating unmeasured PSF wings. The fit solves
+for flux and constant background, optionally including a background gradient.
+Existing grid-search controls and `psf_max_reduced_chi2` remain available.
+`psf_shift_sign` applies to the QR2 optical model only; DR1 and QR3 use physical pixel
+coordinates directly. Missing or malformed ePSF models raise errors rather than
+falling back to optical-PSF processing.
+
+PSF errors are formal covariance errors at the chosen centroid. They do not
+include centroid uncertainty, an aperture correction, or the archive's additional
+systematic uncertainty floor. This remains an isolated-source fitter, without
+Tractor's simultaneous modelling of neighbouring sources. Inspect reduced chi-square
+and masks before interpreting scientific differences from archive photometry.
+
+FITS outputs record `SAPMCOLL`, `SWCSCOLL`, `WAVESRC`, and (when channel binning is
+requested) `SCHCOLL`. DR1 and QR3 PSF spectra also record `PSFMODEL=EPSF`, `PSFNORM=FULL`,
+`ERRTYPE=FORMAL`, and available embedded calibration reference IDs (`EPSFREF` and
+HISTORY). Raw PSF measurements include the selected zone, oversampling, reference
+ID, fit position and diagnostics. Raw measurements also record the sampled bandwidth and
+wavelength source. Aperture fluxes remain finite-aperture measurements; this
+stage adds no aperture-to-total-flux correction.
+
+New cutouts use `download_dir/<release>/<object_name>/`; legacy
+`download_dir/<object_name>/` caches remain readable when their release can be
+established. Calibration caches retain their `<release>/<collection>/` layout.
+Pipeline products are written under `output_dir/<release>/` to avoid overwriting
+another release's results. Existing bundled QR2 products are left in place.
+
+Leave `sapm_collection` and `spectral_channels_collection` as `None` to choose:
+
+| Release | Solid-angle pixel map | Spectral channels |
+| --- | --- | --- |
+| QR2 / QR2 deep | `cal-sapm-v2-2025-164` | `cal-sch-v1-2026-106` |
+| DR1 / QR3 | `cal-sapm-v3-2026-191` | `cal-sch-v2-2026-229` |
+
+Explicit collection strings remain expert overrides; they must match the input
+release. DR1 and QR3 use uncompressed `.fits` channel tables. They share
+collection IDs and use separate archive prefixes and local caches.
+[IRSA release documentation](https://irsa.ipac.caltech.edu/spherex-archive-documentation/spherex-data-releases/).
+
+See [DR1 validation](validation/DR1.md) for the six-detector sample and
+reproduction commands, and [stage-four validation](validation/QR3_STAGE4.md)
+for the historical QR2/QR3 comparison.
+
+Run the release regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ### 4. Calibration
 
@@ -128,15 +223,26 @@ enabled, these files define wavelength-channel centers and edges used to bin rep
 Aperture photometry is performed on calibrated cutout images. The source aperture is centered on the epoch-adjusted
 target position. A local annulus is used to estimate the background, with configurable sigma clipping and background
 estimator (`mean`, `median`, or `mode`). Bad pixels are excluded from the source aperture and the background annulus.
-Known objects are masked only in the latter.
+Known-source pixels (`SOURCE`, bit 21) are masked in the annulus, but retained
+for the target measurement. DR1 and QR3 reject an unusable background instead of silently
+relaxing that mask. Background uncertainties use the number of samples surviving
+both masking and sigma clipping.
+
+DR1 and QR3 also reject apertures that lose source area through excluded/nonfinite
+pixels, invalid variance or image boundaries. `aperture_masked_policy="allow"`
+explicitly permits reporting the surviving flux without a missing-light correction;
+raw measurements identify that condition. QR2 retains its legacy allow default.
 
 The pipeline can measure multiple aperture radii for diagnostics but builds the final aperture spectrum from
 `selected_aperture_radius_pix`.
 
 ### 6. PSF photometry
 
-PSF photometry extracts a SPHEREx PSF kernel from the calibration information contained in the cutout file. The PSF is
-shifted to the subpixel source position and fitted with a weighted linear model.
+PSF photometry uses the QR2 optical `PSF` cube or the DR1/QR3 `EPSF` table in the cutout.
+DR1 and QR3 models are evaluated at native pixel centers for the source's subpixel
+position; QR2 retains its optical-kernel shift/rebin path. A weighted linear fit
+solves for flux and background. See [data release handling](#3-data-release-handling)
+for normalization, uncertainty and isolated-source limitations.
 
 Optional local grid search can refine the centroid around the WCS-predicted position. This is controlled by:
 
@@ -254,6 +360,21 @@ pmDec =  -16.156 mas/yr
 reference epoch = 2016.0
 ```
 
+Run the top-level examples from `src/` after installing the package:
+
+```bash
+cd src
+python run_spherex_pipeline.py  # QR3 download/extraction; may retrieve many exposures
+python plot_images.py           # requires the QR3 cache from extraction
+python compare_spectra.py       # offline demo using bundled QR2 spectra/templates
+python plot_sequence.py         # offline plot of the bundled QR2 standards
+```
+
+New products are written under the ignored `outputs/` directory, with release
+subdirectories. Bundled QR2 FITS spectra and plots remain in `resources/`.
+The raw exposure cutouts are not bundled; setting `query_irsa_for_cutouts=False`
+requires an existing cache for the selected release.
+
 ### a) Run the SPHEREx pipeline
 
 This example is based on `run_spherex_pipeline.py`.
@@ -272,6 +393,7 @@ pmra, pmdec = 1238.244, -16.156
 ref_epoch = 2016.0
 
 cfg = PipelineConfig(
+    data_release="qr3",
     # Photometry mode: "aperture", "psf", or "both".
     # "both" writes independent aperture and PSF spectra/plots in one run.
     photometry_method="both",
@@ -299,7 +421,7 @@ cfg = PipelineConfig(
     use_spectral_channels_for_binning=True,
     spectral_channels_bin_by="integrate",
     spectral_channels_min_points_per_bin=1,
-    spectral_channels_collection="cal-sch-v1-2026-106",
+    spectral_channels_collection=None,
 
     # Download/cache settings
     cutout_size_arcsec=120,
@@ -313,14 +435,16 @@ cfg = PipelineConfig(
     # Calibration cache settings
     sapm_cache_dir="../resources/spherex_calibration_files/spherex_sapm_cache",
     redownload_sapm_files=False,
-    sapm_collection="cal-sapm-v2-2025-164",
+    sapm_collection=None,
+    spectral_wcs_cache_dir="../resources/spherex_calibration_files/spherex_spectral_wcs_cache",
+    spectral_wcs_collection=None,
     spectral_channels_cache_dir="../resources/spherex_calibration_files/spherex_spectral_channels_cache",
     redownload_spectral_channels=False,
 
     # Outputs
-    output_dir="../resources/objects/spectra",
-    save_raw_measurements=False,
-    save_manifest=False,
+    output_dir="../outputs/spectra",
+    save_raw_measurements=True,
+    save_manifest=True,
 
     # Proper motion propagation
     reference_epoch_yr=ref_epoch,
@@ -347,17 +471,17 @@ spectra, measurements = run_spherex_pipeline(
 Expected products include:
 
 ```text
-../resources/objects/spectra/fits/T2 SIMP J013656.5+093347.3_aperture_spectrum.fits
-../resources/objects/spectra/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits
-../resources/objects/spectra/plots/T2 SIMP J013656.5+093347.3_aperture_spectrum.pdf
-../resources/objects/spectra/plots/T2 SIMP J013656.5+093347.3_psf_spectrum.pdf
+../outputs/spectra/qr3/fits/T2 SIMP J013656.5+093347.3_aperture_spectrum.fits
+../outputs/spectra/qr3/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits
+../outputs/spectra/qr3/plots/T2 SIMP J013656.5+093347.3_aperture_spectrum.pdf
+../outputs/spectra/qr3/plots/T2 SIMP J013656.5+093347.3_psf_spectrum.pdf
 ```
 
 When `photometry_method="aperture"` or `photometry_method="psf"`, the first return value is a single
 `astropy.table.Table`. When `photometry_method="both"`, the first return value is a dictionary with keys such as
 `"aperture"` and `"psf"`.
 
-Spectrum diagnostic plots:
+Bundled QR2 diagnostic plots (illustrations, not outputs from the QR3 example):
 
 a) Aperture photometry:
 
@@ -371,6 +495,11 @@ b) PSF photometry:
 
 This example is based on `compare_spectra.py`. It loads a set of template FITS spectra, creates `Spectrum` objects,
 compares an observed spectrum to templates using reduced chi-square, and plots the best matches.
+This offline demo deliberately uses the bundled QR2 target and QR2 SPHEREx
+standard library. Do not substitute a QR3 target while retaining these templates.
+`src/compare_spectra.py` checks `DATAREL` on both inputs and rejects a mismatch.
+For QR3 comparison, regenerate the SPHEREx standards on the same release and
+photometry method, then change both input locations and the selected release.
 
 ```python
 import os
@@ -383,8 +512,11 @@ from spexpi.spectrum_comparator import Spectrum, SpectrumTemplateComparator
 from spexpi.spectrum_plotter import create_comparison_plot
 
 
-def extract_spectrum_from_fits(fits_file_path):
+def extract_spectrum_from_fits(fits_file_path, expected_release):
     with fits.open(fits_file_path) as hdul:
+        actual_release = str(hdul[0].header.get("DATAREL", "unknown")).lower()
+        if actual_release != expected_release:
+            raise ValueError(f"Expected {expected_release}, found {actual_release}")
         data = hdul[1].data
         wavelength = data["WAVELENGTH"]
         flux = data["FLUX"]
@@ -394,6 +526,7 @@ def extract_spectrum_from_fits(fits_file_path):
 
 warnings.simplefilter("ignore", category=Warning)
 
+data_release = "qr2"  # Bundled target and SPHEREx standard library
 wl_unit = u.um
 flux_unit = u.Jy
 
@@ -403,7 +536,7 @@ templates = []
 
 for filename in sorted(f for f in os.listdir(standards_dir) if f.endswith(".fits")):
     full_path = os.path.join(standards_dir, filename)
-    wavelength, flux, flux_error = extract_spectrum_from_fits(full_path)
+    wavelength, flux, flux_error = extract_spectrum_from_fits(full_path, data_release)
 
     spt = filename.split()[0].replace("_", "")
 
@@ -420,7 +553,7 @@ for filename in sorted(f for f in os.listdir(standards_dir) if f.endswith(".fits
 object_name = "T2 SIMP J013656.5+093347.3"
 fits_path = "../resources/objects/spectra/fits/T2 SIMP J013656.5+093347.3_psf_spectrum.fits"
 
-wavelength, flux, flux_error = extract_spectrum_from_fits(fits_path)
+wavelength, flux, flux_error = extract_spectrum_from_fits(fits_path, data_release)
 
 observed = Spectrum(
     label=object_name,
@@ -448,10 +581,11 @@ print("Statistic:", result.best_match.statistic)
 create_comparison_plot(
     result,
     object_name=object_name,
-    output_dir="../resources/objects/spectra/plots",
+    output_dir=f"../outputs/comparisons/{data_release}",
     plot_format="pdf",
     plot_observed_error=True,
     plot_template_error=False,
+    open_plot=False,
 )
 ```
 
@@ -465,7 +599,7 @@ Supported scaling modes include:
 - `least-squares`
 - `scale-shift`
 
-Comparison plot:
+Bundled QR2 comparison plot:
 
 <img src="resources/objects/spectra/plots/T2 SIMP J013656.5+093347.3_comparison.png" alt="Alt Text" style="width:70%; height:auto;">
 
@@ -487,6 +621,7 @@ import warnings
 
 from spexpi.image_plotter import plot_images
 from spexpi.image_stacker import stack_images
+from spexpi.spherex_pipeline import PipelineConfig, get_object_download_dir
 
 warnings.filterwarnings("ignore")
 
@@ -495,8 +630,10 @@ ra, dec = 24.2455, 9.5625
 object_name = "T2 SIMP J013656.5+093347.3"
 
 image_size_arcsec = 100
-data_dir = "../resources/objects/data/" + object_name.replace(" ", "_")
-output_dir = "../resources/objects/images_v2"
+data_release = "qr3"
+cfg = PipelineConfig(data_release=data_release, download_dir="../resources/objects/data")
+data_dir = str(get_object_download_dir(cfg, object_name))
+output_dir = f"../outputs/images/{data_release}"
 
 images = stack_images(
     ra,
@@ -517,7 +654,7 @@ plot_images(
     image_contrast=10,
     object_name=object_name,
     output_dir=output_dir,
-    open_plot=True,
+    open_plot=False,
     plot_format="pdf",
 )
 ```
@@ -525,7 +662,7 @@ plot_images(
 The image workflow is useful for checking whether the target is centered, whether nearby sources contaminate the
 aperture, and whether a detector-specific issue is present.
 
-Images plot:
+Bundled QR2 images (illustration):
 
 <img src="resources/objects/images/plots/T2 SIMP J013656.5+093347.3_images.png" alt="Images" style="width:100%; height:auto;">
 
@@ -535,7 +672,9 @@ Images plot:
 
 ### Spectrum FITS files
 
-The pipeline writes one FITS spectrum per selected method:
+`PipelineConfig.output_dir` is a base directory. Extraction adds the selected
+release, writing spectra to `<output_dir>/<release>/fits/` and plots to
+`<output_dir>/<release>/plots/`. The pipeline writes one FITS spectrum per method:
 
 ```text
 <object_name>_aperture_spectrum.fits
@@ -559,7 +698,7 @@ statistics when available.
 Plots are saved to:
 
 ```text
-<output_dir>/plots/
+<output_dir>/<release>/plots/
 ```
 
 The plotting unit is controlled by `plot_flux_lambda`:
@@ -572,7 +711,7 @@ The plotting unit is controlled by `plot_flux_lambda`:
 If `save_raw_measurements=True`, the pipeline writes all per-cutout photometry measurements to:
 
 ```text
-<output_dir>/fits/<object_name>_measurements.fits
+<output_dir>/<release>/fits/<object_name>_measurements.fits
 ```
 
 ### Manifests
@@ -628,7 +767,8 @@ local file paths, download status, and inferred data release.
 
 #### `prepare_cached_cutout_rows(object_name, cfg)`
 
-Build row dictionaries from already cached FITS files in `download_dir/<object_name>/`.
+Build row dictionaries from `download_dir/<release>/<object_name>/`, with legacy
+object-only cache support when provenance can be established.
 
 #### `open_cutouts_parallel(prepared_rows, ra, dec, cfg)`
 
@@ -638,8 +778,8 @@ return cutout dictionaries.
 #### `process_cutout_row(row, ra, dec, cfg)`
 
 Open one FITS cutout and build the in-memory representation needed for photometry. This includes `IMAGE`, `FLAGS`,
-`VARIANCE`, optional `ZODI`, optional `PSF`, detector number, wavelength, projected source position, and release
-metadata.
+`VARIANCE`, optional `ZODI`, QR2 `PSF` or QR3 `EPSF`, detector number, calibrated
+wavelength, projected source position, and release metadata.
 
 #### `measure_cutout_photometry(row, sapm_cache, cfg)`
 
@@ -696,6 +836,15 @@ Write the inferred `DATAREL` keyword into all FITS HDUs where possible.
 #### `load_sapm(detector, cfg, data_release)`
 
 Load and cache the solid-angle pixel map for a detector and data release.
+
+#### `load_spectral_wcs(detector, cfg, data_release)`
+
+Load and cache full-resolution QR3 `CWAVE`/`CBAND` maps in sky detector coordinates.
+
+#### `select_epsf_zone(hdul, x, y)`, `extract_spherex_epsf_kernel(hdul, x, y, cfg)`
+
+Select a QR3 zone using parent-detector coordinates and render the ePSF at native
+pixel centers. Full-model normalization is retained when the fitting window is clipped.
 
 #### `load_spectral_channels_calibration(cfg, data_release=None)`
 
@@ -846,8 +995,10 @@ Parameters:
 - `aperture_radius_pix`: radius used for overlay diagnostics.
 - `background_inner_radius_pix`: inner annulus radius for overlay diagnostics.
 - `background_outer_radius_pix`: outer annulus radius for overlay diagnostics.
-- `fatal_flag_bits`: bit flags excluded from stacking.
-- `include_reference_image`: include a reference image in output list.
+- `fatal_flag_bits`: optional override; None selects the release-specific mosaic policy.
+  Flagged science is masked before reprojection; original flag bits are propagated by OR.
+- `include_reference_image`: include the first exposure in the mean stack. Keep `True`
+  (the default) when only one exposure is available per detector; `False` excludes it.
 - `overwrite`: overwrite stacked FITS files.
 - `verbose`: print progress.
 
@@ -869,8 +1020,8 @@ plot_images(
     image_size=100,
     image_contrast=10,
     object_name="T2 SIMP J013656.5+093347.3",
-    output_dir="../resources/objects/images_v2",
-    open_plot=True,
+    output_dir="../outputs/images/qr3",
+    open_plot=False,
     plot_format="pdf",
 )
 ```
@@ -933,6 +1084,7 @@ Create a compact object name from coordinates.
 
 | Parameter            |                               Default | Description                                                         |
 |----------------------|--------------------------------------:|---------------------------------------------------------------------|
+| `data_release` | `None` | Select a release, or require unambiguous input provenance. |
 | `tap_url`            | `"https://irsa.ipac.caltech.edu/TAP"` | IRSA TAP service URL used to discover SPHEREx image artifacts.      |
 | `cutout_size_arcsec` |                                 `180` | Angular size of the requested IRSA HTTP cutout, in arcseconds.      |
 | `max_workers`        |                                   `8` | Maximum number of worker threads used for download/open operations. |
@@ -972,7 +1124,15 @@ Create a compact object name from coordinates.
 | `cache_sapm_files`      |                                           `True` | Cache detector solid-angle pixel maps locally after first use.                 |
 | `sapm_cache_dir`        | `"spherex_calibration_files/spherex_sapm_cache"` | Base directory for cached solid-angle pixel maps, grouped by inferred release. |
 | `redownload_sapm_files` |                                          `False` | If `True`, refresh cached solid-angle pixel maps from S3.                      |
-| `sapm_collection`       |                         `"cal-sapm-v2-2025-164"` | Calibration collection name for the solid-angle pixel maps.                    |
+| `sapm_collection`       |                         `None` | Release-specific SAPM default; string values override it.                    |
+
+### Full-resolution spectral WCS (QR3)
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `spectral_wcs_cache_dir` | `"spherex_calibration_files/spherex_spectral_wcs_cache"` | Full-resolution map cache, grouped by release and collection. |
+| `spectral_wcs_collection` | `None` | QR3 defaults to `cal-swcs-v5-2026-191`; an explicit string overrides it. |
+| `redownload_spectral_wcs` | `False` | Refresh each detector's maps once in the current run. |
 
 ### Photometry mode
 
@@ -997,8 +1157,8 @@ Create a compact object name from coordinates.
 
 | Parameter                           |              Default | Description                                                                          |
 |-------------------------------------|---------------------:|--------------------------------------------------------------------------------------|
-| `psf_kernel_radius_native`          |                  `5` | Half-size of the rebinned native-pixel PSF kernel.                                   |
-| `psf_shift_sign`                    |                `1.0` | Sign convention applied to the subpixel PSF shift.                                   |
+| `psf_kernel_radius_native`          |                  `5` | Half-size of the native PSF fitting window; QR3 evaluates its ePSF directly.                                   |
+| `psf_shift_sign`                    |                `1.0` | QR2 optical-PSF shift sign; unused for QR3 native-coordinate evaluation.                                   |
 | `psf_fit_background_gradient`       |              `False` | If `True`, include linear x/y background-gradient terms in the PSF fit.              |
 | `psf_min_valid_pixels`              |                  `6` | Minimum number of unmasked pixels required for a valid PSF fit.                      |
 | `psf_max_reduced_chi2`              |               `None` | Optional maximum reduced chi-square above which PSF measurements are rejected.       |
@@ -1012,14 +1172,58 @@ Create a compact object name from coordinates.
 
 | Parameter                  |                                                                        Default | Description                                                                                       |
 |----------------------------|-------------------------------------------------------------------------------:|---------------------------------------------------------------------------------------------------|
-| `bad_flag_bits`            | `(0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)` | SPHEREx `FLAGS` bits treated as fatal and excluded from photometry.                               |
-| `aperture_flag_count_bits` | `(0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)` | `FLAGS` bits counted inside apertures for diagnostics.                                            |
+| `bad_flag_bits` | `None` | Independent source exclusion override; None resolves the release default below. |
+| `background_flag_bits` | `None` | Independent annulus exclusion override; defaults include SOURCE (21). |
+| `aperture_flag_count_bits` | `None` | Diagnostic warning-count override, independent of source masking. |
+| `aperture_masked_policy` | `None` | QR3 resolves to `"reject"`, QR2 to `"allow"`; allow reports partial source flux without correcting it. |
+| `allow_source_background_fallback` | `None` | QR3 resolves to False, QR2 to True. Any SOURCE-mask relaxation is recorded. |
 | `sanitize_flux`            |                                                                         `True` | Remove non-finite flux/error values, zero placeholders, and invalid uncertainties before binning. |
 | `keep_negative_flux`       |                                                                         `True` | Keep negative background-subtracted fluxes; recommended for unbiased faint-source spectra.        |
 | `remove_outliers`          |                                                                        `False` | Apply detector-wise wavelength-bin outlier rejection before final binning.                        |
 | `outlier_detectors`        |                                                           `(1, 2, 3, 4, 5, 6)` | Detector numbers on which outlier rejection is applied.                                           |
 | `outlier_nbr_of_bins`      |                                                                            `8` | Number of wavelength bins per detector used for local outlier statistics.                         |
 | `outlier_sigma`            |                                                                          `3.0` | Sigma threshold for MAD-based outlier rejection.                                                  |
+
+
+The policies use L2 bit positions (`1 << bit`), not L3 measurement flags:
+
+```python
+# QR3 conservative source mask (not the shorter archive/Tractor fit policy):
+(0, 1, 2, 6, 7, 9, 10, 11, 14, 15, 17, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29)
+# QR3 annulus: the source default above plus SOURCE (21).
+# QR3 mosaics (archive mosaic policy; 1/19/21 are retained as warnings):
+(0, 2, 6, 7, 9, 10, 11, 14, 15, 17, 20, 22, 23, 24, 25, 26, 27, 28, 29)
+# QR2 legacy source and mosaic defaults:
+(0, 1, 2, 4, 6, 7, 9, 10, 11, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)
+```
+
+QR3 adds CROSSTALK (20), GHOST_FPA (23, currently unused) and STREAK (25), and
+omits the undefined bit 4. DICHROIC (7), PHANMISS (14), TRANSIENT (0), OVERFLOW (1)
+and OUTLIER (19) remain conservative source exclusions. FULLSAMPLE (12) is
+informational, and SOURCE (21) is not fatal for the target. An explicit empty tuple
+`()` disables that particular bit mask; the source, background and warning
+policies are independently configurable. `resolved_flag_bits(cfg, purpose)`
+returns the effective tuple (`purpose="source"`, `"background"` or `"warning"`).
+
+Raw measurements retain `warning_flags`, the OR of original L2 bits within 2.5
+pixels of the relevant source position. This includes informational flags and
+should not be interpreted as automatic rejection. Aperture diagnostics also
+record missing/covered area fractions, actual background sample count, background
+status and whether SOURCE masking was relaxed. `background_exclusion_mask` in a
+raw measurement records the actual mask used; FITS `BGMASK` records the configured
+policy. Spectrum headers include `SRCMASK`, `BGMASK`, and for apertures `APMASK`,
+`BGCOUNT=MASKCLIP` and `BGSRCFB`.
+
+Stacking selects its default mask from input release/version unless
+`fatal_flag_bits` is supplied. It masks raw science pixels before resampling and
+propagates contributor flags by bitwise OR, never bilinear interpolation of flag
+numbers. Missing coverage carries MISSING_DATA (9). Mixed mask/release policies
+within one detector stack are rejected. Stack headers record `FLAGPOL` and
+`MASKBITS`. These fixes can change image products and aperture uncertainties
+for QR2 as well as QR3; the QR2 exclusion defaults themselves are unchanged.
+
+See the [mask-policy validation](validation/QR3_FLAGS.md) for the rationale,
+regressions and differences from the original validation snapshot.
 
 ### Spectral oversampling reduction
 
@@ -1030,7 +1234,7 @@ Create a compact object name from coordinates.
 | `spectral_channels_bin_by`             |                                                       `"integrate"` | Binning mode for `spectral_channels`: `'integrate'`, `'edges'`, or `'nearest'`.                |
 | `spectral_channels_min_points_per_bin` |                                                                 `1` | Minimum number of measurements required in a spectral-channel bin.                             |
 | `spectral_channels_integrate_errors`   |                                                      `"quadrature"` | Uncertainty propagation for integrated bins: `'quadrature'` or `'weighted'`.                   |
-| `spectral_channels_collection`         |                                             `"cal-sch-v1-2026-106"` | Optional `spectral_channels` calibration collection name used to build default S3 paths.       |
+| `spectral_channels_collection`         |                                             `None` | Release-specific spectral-channel default; string values override it.       |
 | `spectral_channels_s3_template`        |                                                              `None` | Optional S3 template for `spectral_channels`; may include `{data_release}` and `{collection}`. |
 | `spectral_channels_cache_dir`          | `"spherex_calibration_files/`<br>`spherex_spectral_channels_cache"` | Base directory for cached `spectral_channels` calibration files.                               |
 | `redownload_spectral_channels`         |                                                             `False` | If `True`, refresh cached `spectral_channels` calibration files from S3.                       |
@@ -1039,7 +1243,7 @@ Create a compact object name from coordinates.
 
 | Parameter                                  |              Default | Description                                                                                                                       |
 |--------------------------------------------|---------------------:|-----------------------------------------------------------------------------------------------------------------------------------|
-| `output_dir`                               |  `"spherex_spectra"` | Base output directory for spectra, plots, and optional manifests.                                                                 |
+| `output_dir`                               |  `"spherex_spectra"` | Base output directory; extraction adds `<release>/fits` and `<release>/plots`.                                                                 |
 | `save_raw_measurements`                    |              `False` | If `True`, write the per-cutout measurement table to FITS.                                                                        |
 | `save_manifest`                            |              `False` | If `True`, write CSV/JSONL processing manifests for cutouts and measurements.                                                     |
 | `manifest_format`                          |             `"both"` | Manifest output format: `'csv'`, `'jsonl'`, or `'both'`.                                                                          |
@@ -1063,6 +1267,32 @@ Create a compact object name from coordinates.
 | `vertical_line_position`                   |                `0.0` | Position of the vertical line in microns.                                                                                         |
 
 ---
+
+## Migrating an existing QR2 workflow
+
+1. Keep the existing QR2 raw cache, spectra and standards. QR3 covers later
+   survey observations; it is not a complete reprocessing of QR2 epochs. DR1
+   reprocessing is distinct and is not implicitly supported by selecting QR3.
+2. Set `data_release="qr3"`; choose aperture, PSF, or both. Leave collection
+   overrides unset so each calibration comes from its release-specific default.
+   Set `query_irsa_for_cutouts=False` only after populating the QR3 cache.
+3. Write new products to a separate base directory such as `outputs/spectra`.
+   Extraction appends `qr3`; do not append the release twice. Image-stack and
+   comparator functions take literal output directories, so include the release
+   explicitly when calling those helpers.
+4. Re-extract each SPHEREx standard using its own position, proper motion and
+   reference epoch, with the same release and photometry method as the target.
+   Collect only the relevant spectrum FITS files in a dedicated QR3 template
+   directory. The bundled library remains QR2; no QR3 replacement library is shipped.
+5. In `compare_spectra.py`, set `data_release="qr3"`, set `fits_path` to
+   `../outputs/spectra/qr3/fits/<target>_psf_spectrum.fits`, and set `data_dir` to
+   the newly assembled QR3 PSF template directory. Inspect fit residuals, masks
+   and quality statistics before interpreting matches.
+
+Do not concatenate QR2 and QR3 measurements without an explicit calibration
+reconciliation. Archive gain-correction products do not reproduce all R7
+processing improvements. See [stage-four validation](validation/QR3_STAGE4.md)
+for what has been checked and for the unavailable remote IRSA comparison.
 
 ## Recommended workflow
 
@@ -1097,13 +1327,12 @@ returns the requested region.
 
 ### Data release cannot be inferred
 
-Recent versions of the pipeline stamp `DATAREL` into downloaded FITS headers. If older cached files lack this keyword
-and their paths do not include a release name, redownload the cutouts or move them under a directory that includes the
-release name, such as:
-
-```text
-data/qr2/<object_name>/
-```
+Recover the original archive URI or other trustworthy provenance first. For a
+known release, restore its cache location or `DATAREL` metadata on a copy.
+`data_release="qr3"` selects/filter inputs; it does not override unknown or
+conflicting file provenance. Never relabel QR2 data as QR3 or rename unknown
+files into a release directory just to bypass the error. If provenance cannot
+be recovered, download the correct release again.
 
 ### PSF spectrum is noisy
 

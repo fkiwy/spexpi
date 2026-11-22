@@ -7,8 +7,11 @@ import logging
 import math
 import re
 import time
+import threading
+import tempfile
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -28,13 +31,33 @@ from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 from packaging.version import Version
+from spexpi.flag_policy import LEGACY_FATAL_BITS, QR3_SOURCE_BITS, QR3_BACKGROUND_BITS, QR3_WARNING_BITS, bitmask, validate_bits
+from photutils.psf import ImagePSF
 from photutils.aperture import CircularAnnulus, CircularAperture, ApertureStats, aperture_photometry
 from scipy.interpolate import PchipInterpolator
-from scipy.ndimage import shift as ndi_shift
+from scipy.ndimage import shift as ndi_shift, map_coordinates
 from tqdm.auto import tqdm
 
 VERSION_FIXED = Version("6.5.6")
 PSF_FIX_TAG = "psffix1"
+
+# DR1 and QR3 share calibration identifiers but have separate archive paths.
+EPSF_RELEASES = frozenset({"dr1", "qr3"})
+EPSF_CALIBRATIONS = {
+    "sapm": "cal-sapm-v3-2026-191",
+    "spectral_channels": "cal-sch-v2-2026-229",
+    "spectral_wcs": "cal-swcs-v5-2026-191",
+}
+RELEASE_CALIBRATIONS = {
+    "qr1": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
+    "qr2": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
+    "qr2_deep": {"sapm": "cal-sapm-v2-2025-164", "spectral_channels": "cal-sch-v1-2026-106"},
+    "qr3": EPSF_CALIBRATIONS,
+    "dr1": EPSF_CALIBRATIONS,
+}
+
+
+_CALIBRATION_LOCK = threading.RLock()
 
 logging.getLogger("astropy").setLevel(logging.WARNING)
 
@@ -44,16 +67,19 @@ class PipelineConfig:
     """
     User-facing configuration for the SPHEREx aperture/PSF extraction pipeline.
 
-    The SPHEREx data release is deliberately not a configurable parameter.  The
-    pipeline infers it from the downloaded image URLs or local file paths (for
-    example, paths containing ``/spherex/qr2/``).  Calibration S3 paths are then
-    built from that inferred release so image data and calibration files remain
-    consistent.
+    Select data_release to query or read a single release, or leave it unset
+    to infer an unambiguous release from all inputs. Calibration paths, cutout
+    caches and outputs are scoped by release. Unknown or mixed provenance is
+    rejected. DR1 and QR3 use full-resolution wavelength maps and native-pixel
+    evaluation of the embedded EPSF table for PSF photometry.
     """
 
     # ------------------------------------------------------------------
     # IRSA query and parallel execution
     # ------------------------------------------------------------------
+    data_release: str | None = None
+    """Select qr1, qr2, qr2_deep, qr3 or dr1; None requires unambiguous input provenance."""
+
     tap_url: str = "https://irsa.ipac.caltech.edu/TAP"
     """IRSA TAP service URL used to discover SPHEREx image artifacts."""
 
@@ -135,8 +161,17 @@ class PipelineConfig:
     redownload_sapm_files: bool = False
     """If True, refresh cached solid-angle pixel maps from S3."""
 
-    sapm_collection: str = "cal-sapm-v2-2025-164"
-    """Calibration collection name for the solid-angle pixel maps."""
+    sapm_collection: str | None = None
+    """Explicit SAPM collection override; None selects the release-specific default."""
+
+    spectral_wcs_cache_dir: str = "spherex_calibration_files/spherex_spectral_wcs_cache"
+    """Full-resolution DR1/QR3 CWAVE/CBAND cache, grouped by release and collection."""
+
+    spectral_wcs_collection: str | None = None
+    """Override the release-specific spectral-WCS collection."""
+
+    redownload_spectral_wcs: bool = False
+    """Refresh spectral WCS files once per detector in the current run."""
 
     # ------------------------------------------------------------------
     # Aperture photometry and local background estimation
@@ -184,10 +219,10 @@ class PipelineConfig:
     # PSF photometry
     # ------------------------------------------------------------------
     psf_kernel_radius_native: int = 5
-    """Half-size of the rebinned native-pixel PSF kernel."""
+    """Half-size of the native fitting window; DR1 and QR3 render EPSF at pixel centers."""
 
     psf_shift_sign: float = 1.0
-    """Sign convention applied to the subpixel PSF shift."""
+    """QR2 optical-PSF shift convention; DR1 and QR3 EPSF models use physical pixel coordinates."""
 
     psf_fit_background_gradient: bool = False
     """If True, include linear x/y background-gradient terms in the PSF fit."""
@@ -216,11 +251,23 @@ class PipelineConfig:
     # ------------------------------------------------------------------
     # Pixel flags, flux sanitation, and outlier rejection
     # ------------------------------------------------------------------
-    bad_flag_bits: tuple[int, ...] = (0, 1, 2, 4, 6, 7, 9, 10, 11, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)
-    """SPHEREx FLAGS bits treated as fatal and excluded from photometry."""
+    bad_flag_bits: tuple[int, ...] | None = None
+    """Source exclusions; None selects DR1/QR3 or legacy defaults."""
 
-    aperture_flag_count_bits: tuple[int, ...] = (0, 1, 2, 4, 6, 7, 9, 10, 11, 14, 15, 17, 19, 22, 24, 26, 27, 28, 29)
-    """FLAGS bits counted inside apertures for diagnostics."""
+    background_flag_bits: tuple[int, ...] | None = None
+    """Independent annulus exclusions; defaults additionally mask SOURCE (21)."""
+
+    aperture_flag_count_bits: tuple[int, ...] | None = None
+    """Diagnostic warning bits, independent of source exclusion overrides."""
+
+    aperture_masked_policy: str | None = None
+    """'reject' or 'allow'; defaults to reject for DR1/QR3 and allow for QR2.
+    Reject includes lost aperture area at image/detector boundaries. Allow returns
+    the surviving flux without correcting missing stellar light and reports this.
+    """
+
+    allow_source_background_fallback: bool | None = None
+    """Permit SOURCE pixels if the annulus is otherwise unusable; False for DR1/QR3, True for QR2."""
 
     sanitize_flux: bool = True
     """Remove non-finite flux/error values, zero placeholders, and invalid uncertainties before binning."""
@@ -258,7 +305,7 @@ class PipelineConfig:
     spectral_channels_integrate_errors: str = "quadrature"
     """Uncertainty propagation for integrated bins: 'quadrature' or 'weighted'."""
 
-    spectral_channels_collection: str | None = "cal-sch-v1-2026-106"
+    spectral_channels_collection: str | None = None
     """Optional spectral_channels calibration collection name used to build default S3 paths."""
 
     spectral_channels_s3_template: str | None = None
@@ -351,6 +398,14 @@ def validate_config(cfg: PipelineConfig) -> None:
     unsupported download backend or photometry method without trying to validate
     every scientific choice.
     """
+    for bits in (cfg.bad_flag_bits, cfg.background_flag_bits, cfg.aperture_flag_count_bits):
+        validate_bits(bits)
+    if cfg.allow_source_background_fallback is not None and not isinstance(cfg.allow_source_background_fallback, bool):
+        raise ValueError("allow_source_background_fallback must be bool or None")
+    if cfg.aperture_masked_policy not in (None, "reject", "allow"):
+        raise ValueError("aperture_masked_policy must be reject or allow")
+    if cfg.data_release is not None and normalize_data_release(cfg.data_release) == "unknown":
+        raise ValueError(f"Unsupported SPHEREx data_release={cfg.data_release!r}.")
     backend = str(cfg.download_backend).lower().strip()
     if backend not in ("http", "s3", "s3_cutout"):
         raise ValueError(f"Unsupported download_backend={cfg.download_backend!r}; use 'http' or 's3_cutout'.")
@@ -461,7 +516,11 @@ def safe_filename(text: str, max_len: int = 120) -> str:
 
 def get_object_download_dir(cfg: PipelineConfig, object_name: str) -> Path:
     """Return the dedicated download/cache directory for one object."""
-    path = Path(cfg.download_dir) / safe_filename(object_name)
+    release = get_runtime_data_release(cfg, cfg.data_release or "unknown")
+    path = Path(cfg.download_dir)
+    if release != "unknown":
+        path = path / release
+    path = path / safe_filename(object_name)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -494,7 +553,7 @@ def s3_key_from_irsa_uri(uri: str) -> str:
                 return key
 
     stripped = path.lstrip("/")
-    if stripped.startswith(("qr1/", "qr2/", "qr2_deep/", "cal-", "level2_")):
+    if stripped.partition("/")[0] in RELEASE_CALIBRATIONS or stripped.startswith(("cal-", "level2_")):
         return stripped
 
     raise ValueError(f"Cannot map URI to SPHEREx S3 key: {uri}")
@@ -551,6 +610,9 @@ def stamp_data_release_in_fits(path: str | Path, data_release: str) -> None:
     if release == "unknown":
         return
     try:
+        existing = infer_data_release_from_fits(path)
+        if existing != "unknown" and existing != release:
+            raise ValueError(f"Refusing to replace {existing} provenance with {release} in {path}")
         with fits.open(path, mode="update", memmap=False) as hdul:
             for hdu in hdul:
                 try:
@@ -558,6 +620,8 @@ def stamp_data_release_in_fits(path: str | Path, data_release: str) -> None:
                 except Exception:
                     pass
             hdul.flush()
+    except ValueError:
+        raise
     except Exception:
         # Do not fail the download if the file cannot be stamped.
         pass
@@ -572,8 +636,10 @@ def download_uri_to_file_http(uri: str, local_path: Path, cfg: PipelineConfig) -
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     fh.write(chunk)
+    stamp_data_release_in_fits(tmp_path, infer_data_release_from_uri(uri))
+    with fits.open(tmp_path, mode="update", memmap=False) as hdul:
+        hdul[0].header["SPXREQID"] = (sha256(uri.encode()).hexdigest()[:16], "HTTP cutout request ID")
     tmp_path.replace(local_path)
-    stamp_data_release_in_fits(local_path, infer_data_release_from_uri(uri))
     return local_path
 
 
@@ -700,19 +766,68 @@ def download_uri_to_file(uri: str, local_path: Path, cfg: PipelineConfig, ra: fl
     return download_uri_to_file_http(uri, local_path, cfg)
 
 
+def recenter_http_cutout_uri(uri, row, cfg, ra, dec):
+    """Center an IRSA cutout at the target position for the exposure's epoch."""
+    if ra is None or dec is None or cfg.reference_epoch_yr is None or not (cfg.pmra_masyr or cfg.pmdec_masyr):
+        return uri
+    parsed = urllib.parse.urlsplit(uri)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if parsed.hostname != "irsa.ipac.caltech.edu" or "center" not in dict(query):
+        return uri
+    times = []
+    for name in ("time_bounds_lower", "time_bounds_upper"):
+        value = _row_value(row, name)
+        if value is not None and not np.ma.is_masked(value):
+            try:
+                mjd = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(mjd):
+                times.append(mjd)
+    if not times:
+        return uri
+    adj_ra, adj_dec, status = project_to_epoch(
+        ra, dec, cfg.reference_epoch_yr, cfg.pmra_masyr, cfg.pmdec_masyr, sum(times) / len(times)
+    )
+    if status != "astropy" and not status.startswith("manual_pm_fallback:"):
+        return uri
+    center = f"{adj_ra:.9f},{adj_dec:.9f}d"
+    query = [(key, center if key == "center" else value) for key, value in query]
+    return parsed._replace(query=urllib.parse.urlencode(query, safe=",")).geturl()
+
+
 def prepare_cutout_row_file(row, object_download_dir: Path, cfg: PipelineConfig, ra: float | None = None, dec: float | None = None) -> dict:
     """Ensure one cutout is available locally and return a row-like dict with local_uri."""
     uri = str(_row_value(row, "uri", ""))
     cutout_index = int(_row_value(row, "cutout_index", 0))
+    release = infer_data_release_from_uri(uri)
+    if release == "unknown":
+        raise ValueError(f"Cannot establish SPHEREx release from download URI: {uri}")
+    if cfg.data_release is not None and release != normalize_data_release(cfg.data_release):
+        raise ValueError("Download release conflicts with selected release.")
+    object_download_dir = Path(cfg.download_dir) / release / object_download_dir.name
+    object_download_dir.mkdir(parents=True, exist_ok=True)
     local_file = object_download_dir / filename_from_uri(uri, cutout_index)
     existed_before = local_file.exists() and local_file.stat().st_size > 0
     backend = str(getattr(cfg, "download_backend", "http") or "http").lower().strip()
 
+    download_cfg = cfg
+    if backend == "http":
+        centered_uri = recenter_http_cutout_uri(uri, row, cfg, ra, dec)
+        if existed_before and not cfg.redownload_existing_files and centered_uri != uri:
+            try:
+                request_id = fits.getval(local_file, "SPXREQID")
+            except (KeyError, OSError, ValueError):
+                request_id = None
+            if request_id != sha256(centered_uri.encode()).hexdigest()[:16]:
+                download_cfg = replace(cfg, redownload_existing_files=True)
+        uri = centered_uri
+
     last_exc = None
     for attempt in range(cfg.retries):
         try:
-            download_uri_to_file(uri, local_file, cfg, ra=ra, dec=dec)
-            if existed_before and not cfg.redownload_existing_files:
+            download_uri_to_file(uri, local_file, download_cfg, ra=ra, dec=dec)
+            if existed_before and not download_cfg.redownload_existing_files:
                 status = "cached"
             elif backend in ("s3", "s3_cutout"):
                 status = "downloaded_s3_cutout"
@@ -746,63 +861,83 @@ def prepare_cutout_row_file(row, object_download_dir: Path, cfg: PipelineConfig,
         "download_error": str(last_exc),
         "data_release": infer_data_release_from_uri(uri)
         if infer_data_release_from_uri(uri) != "unknown"
-        else infer_data_release_from_fits(local_file),
+        else "unknown",
     }
 
 
 def normalize_data_release(release: object) -> str:
     """Return a canonical lower-case SPHEREx data-release token."""
     text = str(release or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if "qr2_deep" in text or text in {"spherex_qr2_deep", "qr2deep"}:
-        return "qr2_deep"
-    if "qr2" in text or text == "spherex_qr2":
-        return "qr2"
-    if "qr1" in text or text == "spherex_qr1":
-        return "qr1"
-    return "unknown"
+    aliases = {"qr2deep": "qr2_deep", "dr1_deep": "dr1"}
+    text = text.removeprefix("spherex_")
+    text = aliases.get(text, text)
+    return text if text in RELEASE_CALIBRATIONS else "unknown"
 
 
 def infer_data_release_from_uri(uri: str) -> str:
-    """Infer the SPHEREx data release from an IRSA/S3/local path or URL."""
+    """Recognize complete release path components, never substrings such as qr30."""
     text = str(uri or "").lower().replace("\\", "/")
-    # Check qr2_deep first because it also contains the substring "qr2".
-    if "/spherex/qr2_deep/" in text or "spherex_qr2_deep" in text or "/qr2_deep/" in text:
-        return "qr2_deep"
-    if "/spherex/qr2/" in text or "spherex_qr2" in text or "/qr2/" in text or text.startswith("qr2/"):
-        return "qr2"
-    if "/spherex/qr1/" in text or "spherex_qr1" in text or "/qr1/" in text or text.startswith("qr1/"):
-        return "qr1"
-    return "unknown"
+    path = urllib.parse.unquote(urllib.parse.urlparse(text).path)
+    releases = {normalize_data_release(part) for part in path.split("/")}
+    releases.discard("unknown")
+    if len(releases) > 1:
+        raise ValueError(f"Conflicting SPHEREx releases in path: {uri}")
+    return next(iter(releases), "unknown")
 
 
 def infer_data_release_from_header(header) -> str:
     """Infer the data release from common FITS header keywords when present."""
     if header is None:
         return "unknown"
-    for key in ("DATAREL", "DATA_REL", "OBS_COLLECTION", "OBS-COLL", "COLLECTION", "OBSCOL"):
-        try:
-            release = normalize_data_release(header.get(key))
-            if release != "unknown":
-                return release
-        except Exception:
-            continue
-    return "unknown"
+    releases = {normalize_data_release(header.get(key)) for key in
+                ("DATAREL", "DATA_REL", "OBS_COLLECTION", "OBS-COLL", "COLLECTION", "OBSCOL")}
+    releases.discard("unknown")
+    if len(releases) > 1:
+        raise ValueError("Conflicting SPHEREx release keywords in FITS header.")
+    return next(iter(releases), "unknown")
 
 
 def infer_data_release_from_fits(path: str | Path) -> str:
     """Infer the data release from a local FITS path and, if needed, its headers."""
-    release = infer_data_release_from_uri(str(path))
-    if release != "unknown":
-        return release
-    try:
-        with fits.open(path, memmap=False) as hdul:
-            for hdu in hdul:
-                release = infer_data_release_from_header(getattr(hdu, "header", None))
-                if release != "unknown":
-                    return release
-    except Exception:
-        pass
-    return "qr2"
+    releases = {infer_data_release_from_uri(str(path))}
+    with fits.open(path, memmap=False) as hdul:
+        for hdu in hdul:
+            releases.add(infer_data_release_from_header(hdu.header))
+    releases.discard("unknown")
+    if len(releases) > 1:
+        raise ValueError(f"Conflicting SPHEREx release metadata in {path}")
+    return next(iter(releases), "unknown")
+
+
+def calibration_collection(cfg: PipelineConfig, data_release: str, kind: str) -> str:
+    """Resolve an explicit override or the default for a known release."""
+    release = normalize_data_release(data_release)
+    if release == "unknown":
+        raise ValueError("Cannot select calibration: unknown SPHEREx data release.")
+    fields = {"sapm": cfg.sapm_collection, "spectral_channels": cfg.spectral_channels_collection,
+              "spectral_wcs": cfg.spectral_wcs_collection}
+    if kind not in fields:
+        raise ValueError(f"Unsupported calibration kind: {kind}")
+    if fields[kind]:
+        return fields[kind]
+    if kind not in RELEASE_CALIBRATIONS[release]:
+        raise ValueError(f"No default {kind} calibration for {release}.")
+    return RELEASE_CALIBRATIONS[release][kind]
+
+
+def require_single_data_release(rows: list[dict], selected: str | None = None) -> str:
+    """Reject missing, conflicting, or mixed provenance before processing science data."""
+    if not rows:
+        raise ValueError("No SPHEREx cutouts found.")
+    releases = {normalize_data_release(row.get("data_release")) for row in rows}
+    if "unknown" in releases:
+        raise ValueError("Cannot establish the SPHEREx release for every cutout; provide release metadata.")
+    if len(releases) != 1:
+        raise ValueError("Mixed SPHEREx releases are not supported; extract each release separately.")
+    release = next(iter(releases))
+    if selected is not None and release != normalize_data_release(selected):
+        raise ValueError(f"Cutout release {release} conflicts with selected release {selected}.")
+    return release
 
 
 def set_runtime_data_release(cfg: PipelineConfig, release: str) -> str:
@@ -886,8 +1021,8 @@ def make_sapm_s3_paths(cfg: PipelineConfig, data_release: str) -> dict[int, str]
     return {
         det: (
             f"nasa-irsa-spherex/{release}/{dataset_type}/"
-            f"{cfg.sapm_collection}/{det}/"
-            f"{dataset_type}_D{det}_spx_{cfg.sapm_collection}.fits"
+            f"{calibration_collection(cfg, data_release, 'sapm')}/{det}/"
+            f"{dataset_type}_D{det}_spx_{calibration_collection(cfg, data_release, 'sapm')}.fits"
         )
         for det in range(1, 7)
     }
@@ -898,14 +1033,14 @@ def get_sapm_cache_dir(cfg: PipelineConfig, data_release: str) -> Path:
     release = normalize_data_release(data_release)
     if release == "unknown":
         raise ValueError("Cannot choose SAPM cache directory because the SPHEREx data release is unknown.")
-    path = Path(cfg.sapm_cache_dir) / release / cfg.sapm_collection
+    path = Path(cfg.sapm_cache_dir) / release / calibration_collection(cfg, data_release, "sapm")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def sapm_local_path(detector: int, cfg: PipelineConfig, data_release: str) -> Path:
     """Return local cached filename for one detector SAPM file."""
-    return get_sapm_cache_dir(cfg, data_release) / f"solid_angle_pixel_map_D{int(detector)}_spx_{cfg.sapm_collection}.fits"
+    return get_sapm_cache_dir(cfg, data_release) / f"solid_angle_pixel_map_D{int(detector)}_spx_{calibration_collection(cfg, data_release, 'sapm')}.fits"
 
 
 def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[dict]:
@@ -918,10 +1053,12 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
     The filename order is used as the cutout order.
     """
     object_download_dir = get_object_download_dir(cfg, object_name)
-    files = sorted(
-        p for p in object_download_dir.glob(cfg.cached_cutout_glob)
-        if p.is_file() and not p.name.endswith(".part")
-    )
+    directories = {object_download_dir, Path(cfg.download_dir) / safe_filename(object_name)}
+    if cfg.data_release is None:
+        directories.update(Path(cfg.download_dir) / release / safe_filename(object_name)
+                           for release in RELEASE_CALIBRATIONS)
+    files = sorted({p for directory in directories for p in directory.glob(cfg.cached_cutout_glob)
+                    if p.is_file() and not p.name.endswith(".part")})
 
     rows = []
     iterator = files
@@ -929,6 +1066,11 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
         iterator = tqdm(files, total=len(files), desc=f"Reading cached list for {object_name}", unit="file")
 
     for idx, path in enumerate(iterator, start=1):
+        release = infer_data_release_from_fits(path)
+        if cfg.data_release is not None and release != normalize_data_release(cfg.data_release):
+            if release == "unknown":
+                raise ValueError(f"Cannot establish SPHEREx release for cached file: {path}")
+            continue
         rows.append({
             "uri": str(path),
             "local_uri": str(path),
@@ -936,7 +1078,7 @@ def prepare_cached_cutout_rows(object_name: str, cfg: PipelineConfig) -> list[di
             "time_bounds_lower": np.nan,
             "time_bounds_upper": np.nan,
             "download_status": "local_cache",
-            "data_release": infer_data_release_from_fits(path),
+            "data_release": release,
         })
 
     return rows
@@ -946,6 +1088,13 @@ def query_spherex_cutouts(ra: float, dec: float, cfg: PipelineConfig) -> Table:
     """Query IRSA TAP for SPHEREx cutout URLs covering the target position."""
     service = pyvo.dal.TAPService(cfg.tap_url)
     cutout_size_deg = (cfg.cutout_size_arcsec * u.arcsec).to(u.deg).value
+    release_filter = ""
+    if cfg.data_release is not None:
+        release = normalize_data_release(cfg.data_release)
+        if release == "unknown":
+            raise ValueError("Unsupported SPHEREx release for query.")
+        product_path = "dr1/level2" if release == "dr1" else release
+        release_filter = f"AND a.uri LIKE '%/spherex/{product_path}/%'"
     query = f"""
     SELECT
         'https://irsa.ipac.caltech.edu/' || a.uri || '?center={ra},{dec}d&size={cutout_size_deg:7f}' AS uri,
@@ -954,6 +1103,7 @@ def query_spherex_cutouts(ra: float, dec: float, cfg: PipelineConfig) -> Table:
     FROM spherex.artifact a
     JOIN spherex.plane p ON a.planeid = p.planeid
     WHERE 1 = CONTAINS(POINT('ICRS', {ra}, {dec}), p.poly)
+    {release_filter}
     ORDER BY p.time_bounds_lower
     """
     table = service.search(query).to_table()
@@ -961,37 +1111,132 @@ def query_spherex_cutouts(ra: float, dec: float, cfg: PipelineConfig) -> Table:
     return table
 
 
-def load_sapm(detector: int, cfg: PipelineConfig, data_release: str):
-    """
-    Load the solid-angle pixel map for one detector and one inferred release.
-
-    If cfg.cache_sapm_files=True, the SAPM file is cached locally and reused.
-    """
-    detector = int(detector)
-    release = normalize_data_release(data_release)
-    if release == "unknown":
-        raise ValueError("Cannot load SAPM calibration because the SPHEREx data release is unknown.")
-    s3_path = make_sapm_s3_paths(cfg, release)[detector]
-    local_path = sapm_local_path(detector, cfg, release)
-
-    if cfg.cache_sapm_files:
-        if local_path.exists() and local_path.stat().st_size > 0 and not cfg.redownload_sapm_files:
-            with fits.open(local_path) as hdul:
-                return hdul["IMAGE"].data.astype(float), hdul["IMAGE"].header.copy()
-
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = local_path.with_suffix(local_path.suffix + ".part")
-
-        with fits.open(f"s3://{s3_path}", fsspec_kwargs={"anon": True}) as hdul:
-            hdul.writeto(tmp_path, overwrite=True)
-
+def download_calibration(s3_path: str, local_path: Path, timeout: float = 120) -> None:
+    """Stream a public archive object over verified HTTPS and publish it atomically."""
+    bucket, key = s3_path.removeprefix("s3://").split("/", 1)
+    url = f"https://{bucket}.s3.amazonaws.com/{key}"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = local_path.with_name(local_path.name + ".part")
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as response:
+            response.raise_for_status()
+            with tmp_path.open("wb") as output:
+                for chunk in response.iter_content(1024 * 1024):
+                    output.write(chunk)
+        with fits.open(tmp_path) as hdul:
+            hdul.verify("exception")
         tmp_path.replace(local_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-        with fits.open(local_path) as hdul:
-            return hdul["IMAGE"].data.astype(float), hdul["IMAGE"].header.copy()
 
-    with fits.open(f"s3://{s3_path}", fsspec_kwargs={"anon": True}) as hdul:
-        return hdul["IMAGE"].data.astype(float), hdul["IMAGE"].header.copy()
+def load_sapm(detector: int, cfg: PipelineConfig, data_release: str):
+    """Load the release-specific pixel-area map, retaining its sky orientation."""
+    release = normalize_data_release(data_release)
+    if not cfg.cache_sapm_files:
+        # A no-cache request must never replace/delete an existing persistent file.
+        with tempfile.TemporaryDirectory(prefix="spexpi-sapm-") as directory:
+            path = Path(directory) / "sapm.fits"
+            download_calibration(make_sapm_s3_paths(cfg, release)[int(detector)], path,
+                                 cfg.request_timeout_sec)
+            return read_sapm(path, detector, release)
+    local_path = sapm_local_path(detector, cfg, release)
+    with _CALIBRATION_LOCK:
+        if cfg.redownload_sapm_files or not local_path.exists():
+            download_calibration(make_sapm_s3_paths(cfg, release)[int(detector)], local_path,
+                                 cfg.request_timeout_sec)
+        return read_sapm(local_path, detector, release)
+
+
+def read_sapm(path, detector, release):
+    with fits.open(path) as hdul:
+        image = hdul["IMAGE"]
+        if release in EPSF_RELEASES and image.header.get("DETCOORD", "").strip().lower() != "sky":
+            raise ValueError(f"{release.upper()} SAPM must use sky detector coordinates.")
+        if int(image.header.get("DETECTOR", detector)) != int(detector):
+            raise ValueError("SAPM detector does not match image detector.")
+        if image.data.ndim != 2:
+            raise ValueError("SAPM must be a 2D pixel-area map.")
+        return image.data.astype(float), image.header.copy()
+
+
+def load_spectral_wcs(detector: int, cfg: PipelineConfig, data_release: str):
+    """Load full-resolution wavelength maps once per run and detector (thread safe)."""
+    release = normalize_data_release(data_release)
+    coll = calibration_collection(cfg, release, "spectral_wcs")
+    key = (release, int(detector), coll)
+    with _CALIBRATION_LOCK:
+        cache = getattr(cfg, "_spectral_wcs_maps", None)
+        if cache is None:
+            cache = cfg._spectral_wcs_maps = {}
+        if key not in cache:
+            filename = f"spectral_wcs_D{int(detector)}_spx_{coll}.fits"
+            path = Path(cfg.spectral_wcs_cache_dir) / release / coll / filename
+            if cfg.redownload_spectral_wcs or not path.exists():
+                download_calibration(f"nasa-irsa-spherex/{release}/spectral_wcs/{coll}/{int(detector)}/{filename}",
+                                     path, cfg.request_timeout_sec)
+            with fits.open(path) as hdul:
+                maps = []
+                for name in ("CWAVE", "CBAND"):
+                    hdu = hdul[name]
+                    if hdu.header.get("DETCOORD", hdul[0].header.get("DETCOORD", "")).strip().lower() != "sky":
+                        raise ValueError("Spectral WCS maps must use sky detector coordinates.")
+                    if int(hdu.header.get("DETECTOR", detector)) != int(detector):
+                        raise ValueError("Spectral WCS detector does not match image detector.")
+                    maps.append((hdu.data * Unit(hdu.header["BUNIT"])).to_value(u.um))
+                if maps[0].ndim != 2 or maps[0].shape != maps[1].shape:
+                    raise ValueError("CWAVE and CBAND must be matching 2D maps.")
+                cache[key] = tuple(maps)
+        return cache[key]
+
+
+def qr3_parent_coordinates(header, image_shape, parent_shape):
+    """Require the standard untranslated/scaled sky grid before mapping an ePSF-format cutout."""
+    if header.get("DETCOORD", "").strip().lower() != "sky":
+        raise ValueError("Image must use sky detector coordinates.")
+    for i in (1, 2):
+        for j in (1, 2):
+            expected = 1. if i == j else 0.
+            if (not np.isclose(header.get(f"PC{i}_{j}A", expected), expected)
+                    or not np.isclose(header.get(f"CD{i}_{j}A", expected), expected)):
+                raise ValueError("Unsupported rotated parent-detector WCS.")
+    if "CRPIX1A" not in header or "CRPIX2A" not in header:
+        if tuple(image_shape) != tuple(parent_shape):
+            raise ValueError("Cutout is missing parent-detector CRPIX*A offsets.")
+        return 0., 0.
+    for axis in (1, 2):
+        if (not np.isclose(header.get(f"CDELT{axis}A", 1), 1)
+                or not np.isclose(header.get(f"CRVAL{axis}A", 0), 0)):
+            raise ValueError("Unsupported parent-detector linear WCS.")
+    offsets = (1. - float(header["CRPIX1A"]), 1. - float(header["CRPIX2A"]))
+    if not all(np.isfinite(v) and np.isclose(v, round(v)) for v in offsets):
+        raise ValueError("Cutout offsets must be finite integer detector pixels.")
+    return offsets
+
+
+class SourceOutsideDetectorError(ValueError):
+    """A finite source position falls outside the wavelength calibration grid."""
+
+
+def qr3_wavelength(header, image_shape, x, y, detector, cfg, release="qr3"):
+    """Bilinearly sample full-resolution CWAVE and CBAND at the source position."""
+    cwave, cband = load_spectral_wcs(detector, cfg, release)
+    dx, dy = qr3_parent_coordinates(header, image_shape, cwave.shape)
+    xp, yp = float(x) + dx, float(y) + dy
+    if not (np.isfinite(xp) and np.isfinite(yp)):
+        raise ValueError("Source position in the full-resolution spectral WCS map is nonfinite.")
+    if not (0 <= xp <= cwave.shape[1] - 1 and 0 <= yp <= cwave.shape[0] - 1):
+        raise SourceOutsideDetectorError("Source lies outside the full-resolution spectral WCS map.")
+    values = [float(map_coordinates(m, [[yp], [xp]], order=1, mode="constant", cval=np.nan,
+                                    prefilter=False)[0]) for m in (cwave, cband)]
+    if not all(np.isfinite(v) and v > 0 for v in values):
+        raise ValueError("Nonpositive or nonfinite CWAVE/CBAND at source position.")
+    return values
+
+
+def require_supported_photometry(release, cfg):
+    if str(cfg.photometry_method).strip().lower() not in ("aperture", "psf", "both"):
+        raise ValueError(f"Unsupported photometry method: {cfg.photometry_method}")
 
 
 def detector_from_header(header) -> int:
@@ -1155,19 +1400,29 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
     last_exc = None
     open_path = row.get("local_uri", row.get("uri"))
 
+    file_release = infer_data_release_from_fits(open_path)
+    row_release = normalize_data_release(row.get("data_release"))
+    known = [r for r in (row_release, file_release) if r != "unknown"]
+    release = require_single_data_release(
+        [{"data_release": r} for r in known] or [{"data_release": "unknown"}], cfg.data_release
+    )
+    require_supported_photometry(release, cfg)
     for attempt in range(cfg.retries):
         try:
             with fits.open(open_path) as old_hdul:
-                hdul = update_psf_header(old_hdul)
+                hdul = old_hdul if release in EPSF_RELEASES else update_psf_header(old_hdul)
                 image_hdu = hdul["IMAGE"].copy()
                 flags_hdu = hdul["FLAGS"].copy() if "FLAGS" in hdul else None
                 var_hdu = hdul["VARIANCE"].copy() if "VARIANCE" in hdul else None
                 zodi_hdu = hdul["ZODI"].copy() if "ZODI" in hdul else None
                 psf_hdu = hdul["PSF"].copy() if "PSF" in hdul else None
+                epsf_hdu = hdul["EPSF"].copy() if "EPSF" in hdul else None
+                if release in EPSF_RELEASES and cfg.photometry_method in ("psf", "both") and epsf_hdu is None:
+                    raise ValueError(f"{release.upper()} PSF photometry requires an embedded EPSF table.")
 
                 header = image_hdu.header
                 detector = detector_from_header(header)
-                data_release = normalize_data_release(row.get("data_release", "unknown"))
+                data_release = release
                 if data_release == "unknown":
                     data_release = infer_data_release_from_header(header)
                 if data_release == "unknown":
@@ -1183,8 +1438,9 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                         stamp_data_release_in_fits(open_path, data_release)
 
                 spatial_wcs = WCS(header)
-                spectral_wcs = WCS(header=header, fobj=hdul, key="W")
-                spectral_wcs.sip = None
+                if release not in EPSF_RELEASES:
+                    spectral_wcs = WCS(header=header, fobj=hdul, key="W")
+                    spectral_wcs.sip = None
 
                 obs_mjd = mjd_from_header(header)
                 adj_ra, adj_dec, projection_status = project_to_epoch(
@@ -1203,7 +1459,12 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
 
                 target = SkyCoord(ra=adj_ra, dec=adj_dec, unit="deg", frame="icrs")
                 x_src, y_src = spatial_wcs.world_to_pixel(target)
-                wl_src, _ = spectral_wcs.pixel_to_world(x_src, y_src)
+                if release in EPSF_RELEASES:
+                    wavelength_um, bandwidth_um = qr3_wavelength(
+                        header, image_hdu.data.shape, x_src, y_src, detector, cfg, release)
+                else:
+                    wl_src, _ = spectral_wcs.pixel_to_world(x_src, y_src)
+                    wavelength_um, bandwidth_um = float(wl_src.to(u.um).value), np.nan
 
                 try:
                     sep_as = SkyCoord(ra, dec, unit="deg").separation(SkyCoord(adj_ra, adj_dec, unit="deg")).arcsec
@@ -1232,10 +1493,28 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
                     "variance_hdu": var_hdu,
                     "zodi_hdu": zodi_hdu,
                     "psf_hdu": psf_hdu,
+                    "epsf_hdu": epsf_hdu,
+                    "epsf_reference": next((str(line).split("epsf ", 1)[1].strip()
+                                            for line in header.get("HISTORY", [])
+                                            if str(line).startswith("[CALIB] epsf ")), ""),
                     "x_src": float(x_src),
                     "y_src": float(y_src),
-                    "central_wavelength_um": float(wl_src.to(u.um).value),
+                    "central_wavelength_um": wavelength_um,
+                    "bandwidth_um": bandwidth_um,
+                    "wavelength_source": "CWAVE" if release in EPSF_RELEASES else "WCS-WAVE",
                 }
+        except SourceOutsideDetectorError as exc:
+            return {
+                "uri": str(row.get("uri", open_path)),
+                "local_uri": str(open_path),
+                "data_release": release,
+                "cutout_index": int(row["cutout_index"]),
+                "detector": detector,
+                "x_src": float(x_src),
+                "y_src": float(y_src),
+                "status": "skipped_outside_detector",
+                "open_error": str(exc),
+            }
         except Exception as exc:
             last_exc = exc
             if attempt < cfg.retries - 1:
@@ -1247,6 +1526,7 @@ def process_cutout_row(row, ra: float, dec: float, cfg: PipelineConfig):
         "data_release": normalize_data_release(row.get("data_release", infer_data_release_from_uri(str(open_path)))),
         "cutout_index": int(row["cutout_index"]),
         "status": f"open_failed:{type(last_exc).__name__}",
+        "open_error": str(last_exc),
     }
 
 
@@ -1597,15 +1877,35 @@ def convert_to_ujy(image_data, image_header, sapm_data, sapm_header):
     """Convert an IMAGE array from surface-brightness units to per-pixel uJy."""
     bunit = Unit(image_header.get("BUNIT", "MJy/sr"))
     sapm_unit = Unit(sapm_header.get("BUNIT", "arcsec2"))
-    return ((image_data * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).value
+    return ((image_data * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).to_value(u.uJy)
 
 
 def convert_variance_to_ujy2(var_data, image_header, sapm_data, sapm_header):
     """Convert a VARIANCE array consistently with convert_to_ujy, returning uJy^2."""
     bunit = Unit(image_header.get("BUNIT", "MJy/sr"))
     sapm_unit = Unit(sapm_header.get("BUNIT", "arcsec2"))
-    scale = ((1.0 * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).value
+    scale = ((1.0 * bunit).to(u.uJy / u.arcsec ** 2) * (sapm_data * sapm_unit)).to_value(u.uJy)
     return np.asarray(var_data, dtype=float) * scale ** 2
+
+
+def resolved_flag_bits(cfg, purpose="source"):
+    release = get_runtime_data_release(cfg, cfg.data_release or "unknown")
+    uses_epsf = release in EPSF_RELEASES
+    overrides = {"source": cfg.bad_flag_bits, "background": cfg.background_flag_bits,
+                 "warning": cfg.aperture_flag_count_bits}
+    defaults = {"source": QR3_SOURCE_BITS if uses_epsf else LEGACY_FATAL_BITS,
+                "background": QR3_BACKGROUND_BITS if uses_epsf else (*LEGACY_FATAL_BITS, 21),
+                "warning": QR3_WARNING_BITS if uses_epsf else LEGACY_FATAL_BITS}
+    return tuple(defaults[purpose] if overrides[purpose] is None else overrides[purpose])
+
+
+def source_warning_flags(flags, x, y, radius=2.5):
+    """OR original L2 flags near the source, including non-fatal warnings."""
+    if flags is None or not np.isfinite(x) or not np.isfinite(y):
+        return 0
+    yy, xx = np.indices(flags.shape)
+    values = np.asarray(flags, dtype=np.uint32)[(xx-x)**2+(yy-y)**2 <= radius**2]
+    return int(np.bitwise_or.reduce(values, initial=np.uint32(0)))
 
 
 def make_bad_pixel_mask(flags, flux, bad_flag_bits: Iterable[int]):
@@ -1613,8 +1913,8 @@ def make_bad_pixel_mask(flags, flux, bad_flag_bits: Iterable[int]):
     bad_mask = np.zeros_like(flux, dtype=bool)
 
     if flags is not None:
-        mask_value = sum(1 << int(bit) for bit in bad_flag_bits)
-        bad_mask |= (np.asarray(flags) & mask_value) != 0
+        mask_value = bitmask(bad_flag_bits)
+        bad_mask |= (np.asarray(flags, dtype=np.uint32) & mask_value) != 0
 
     bad_mask |= ~np.isfinite(flux)
     return bad_mask
@@ -1628,17 +1928,91 @@ def count_bad_aperture_flags(flags, x, y, radius_pix, flag_bits):
     ap_mask = aperture.to_mask(method="center").to_image(flags.shape)
     if ap_mask is None:
         return 0
-    ap_flags = np.asarray(flags)[ap_mask > 0]
-    mask_value = sum(1 << int(bit) for bit in flag_bits)
+    ap_flags = np.asarray(flags, dtype=np.uint32)[ap_mask > 0]
+    mask_value = bitmask(flag_bits)
     return int(np.count_nonzero((ap_flags & mask_value) != 0))
+
+
+def select_epsf_zone(hdul, x, y):
+    """Select the nearest zone center in the parent detector's zero-based sky grid.
+
+    Use table coordinates, never row ordering or a square-grid assumption.
+    The half-pixel border in the published zone widths accommodates edge pixels.
+    """
+    hdu = hdul["EPSF"]
+    if not isinstance(hdu, fits.BinTableHDU) or hdu.data is None:
+        raise ValueError("EPSF must be a nonempty binary table.")
+    required = {"EPSF", "BINX", "BINY", "XCENTER", "YCENTER", "XWIDTH", "YWIDTH"}
+    if not required.issubset(hdu.columns.names):
+        raise ValueError("EPSF table is missing zone geometry or model columns.")
+    if hdu.header.get("DETCOORD", "").strip().lower() != "sky":
+        raise ValueError("EPSF table must use sky detector coordinates.")
+    image = hdul["IMAGE"]
+    detector = detector_from_header(image.header)
+    if int(hdu.header.get("DETECTOR", -1)) != detector:
+        raise ValueError("EPSF detector does not match image detector.")
+    dx, dy = qr3_parent_coordinates(image.header, image.data.shape, (2040, 2040))
+    xp, yp = float(x) + dx, float(y) + dy
+    if not (np.isfinite(xp) and np.isfinite(yp) and 0 <= xp < 2040 and 0 <= yp < 2040):
+        raise ValueError("EPSF source position is outside the parent detector.")
+    table = hdu.data
+    xc, yc = np.asarray(table['XCENTER']), np.asarray(table['YCENTER'])
+    width, height = np.asarray(table['XWIDTH']), np.asarray(table['YWIDTH'])
+    if (len(table) == 0 or not all(np.all(np.isfinite(v)) for v in (xc, yc, width, height))
+            or np.any(width <= 0) or np.any(height <= 0)):
+        raise ValueError("Invalid EPSF zone geometry.")
+    index = int(np.argmin((xc - xp)**2 + (yc - yp)**2))
+    if (abs(xp - xc[index]) > width[index] / 2 + 1.e-4
+            or abs(yp - yc[index]) > height[index] / 2 + 1.e-4):
+        raise ValueError("EPSF table has no zone covering the source position.")
+    oversampling = (float(hdu.header.get('OVSMPY', 0)), float(hdu.header.get('OVSMPX', 0)))
+    if not all(np.isfinite(v) and v >= 1 and v == int(v) for v in oversampling):
+        raise ValueError("EPSF OVSMPX/OVSMPY must be positive integers.")
+    return index, tuple(int(v) for v in oversampling)
+
+
+def extract_spherex_epsf_kernel(hdul, x, y, cfg):
+    """Render an effective PSF at native pixel centers, then normalize full support.
+
+    This follows IRSA's ImagePSF rendering recipe. Do not integrate detector
+    pixels again: their response is already part of the ePSF. Normalize before
+    truncating to the requested fitting radius or clipping to image/mask bounds.
+    """
+    index, oversampling = select_epsf_zone(hdul, x, y)
+    hdu = hdul['EPSF']
+    models = getattr(hdu, '_spexpi_models', None)
+    if models is None:
+        models = hdu._spexpi_models = {}
+    if index not in models:
+        data = np.asarray(hdu.data['EPSF'][index], dtype=float)
+        if (data.ndim != 2 or min(data.shape) < 4 or any(n % 2 != 1 for n in data.shape)
+                or not np.all(np.isfinite(data)) or np.sum(data) <= 0):
+            raise ValueError("Invalid EPSF image array.")
+        models[index] = ImagePSF(data=data, oversampling=oversampling, fill_value=0.)
+    model = models[index]
+    radius = int(cfg.psf_kernel_radius_native)
+    if radius < 1 or radius != cfg.psf_kernel_radius_native:
+        raise ValueError("PSF kernel radius must be a positive integer.")
+    support = max(radius, int(np.ceil(max((np.array(model.data.shape) - 1) / 2
+                                         / np.array(oversampling)))) + 1)
+    yy, xx = np.mgrid[-support:support+1, -support:support+1]
+    values = model.evaluate(xx + np.round(x), yy + np.round(y), flux=1., x_0=x, y_0=y)
+    total = float(np.sum(values))
+    if not np.all(np.isfinite(values)) or not np.isfinite(total) or total <= 0:
+        raise ValueError("EPSF native rendering has nonpositive or invalid normalization.")
+    values = values / total
+    start = support - radius
+    return values[start:start+2*radius+1, start:start+2*radius+1]
 
 
 def extract_spherex_psf_kernel(hdul, x, y, cfg: PipelineConfig):
     """
     Extract a native-pixel SPHEREx PSF kernel from the PSF extension.
     """
+    if "EPSF" in hdul:
+        return extract_spherex_epsf_kernel(hdul, x, y, cfg)
     if "PSF" not in hdul:
-        raise ValueError("No PSF extension present in this cutout.")
+        raise ValueError("No PSF or EPSF extension present in this cutout.")
 
     psf_cube = hdul["PSF"].data
     psf_header = hdul["PSF"].header
@@ -1707,7 +2081,7 @@ def extract_spherex_psf_kernel(hdul, x, y, cfg: PipelineConfig):
     return psf_native
 
 
-def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfig):
+def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfig, *, normalize_psf=True):
     """
     Weighted linear PSF photometry in uJy.
 
@@ -1721,7 +2095,8 @@ def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfi
     psf_sum = np.nansum(psf)
     if not np.isfinite(psf_sum) or psf_sum <= 0:
         return np.nan, np.nan, {"psf_status": "bad_psf"}
-    psf /= psf_sum
+    if normalize_psf:
+        psf /= psf_sum
 
     ph, pw = psf.shape
     x0 = int(np.round(x))
@@ -1763,8 +2138,8 @@ def psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg: PipelineConfi
 
     valid = np.isfinite(cut) & np.isfinite(psf_cut) & np.isfinite(var_cut) & (var_cut > 0)
     if flags is not None:
-        flag_cut = flags[y1:y2, x1:x2]
-        fatal_mask = sum(1 << int(bit) for bit in cfg.bad_flag_bits)
+        flag_cut = np.asarray(flags[y1:y2, x1:x2], dtype=np.uint32)
+        fatal_mask = bitmask(resolved_flag_bits(cfg))
         valid &= ((flag_cut & fatal_mask) == 0)
 
     n_valid = int(np.count_nonzero(valid))
@@ -1836,10 +2211,12 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
     flux_uJy, err_uJy, info
     """
     detector = int(detector)
+    if "EPSF" in hdul_like and not (0 <= x < flux_ujy.shape[1] and 0 <= y < flux_ujy.shape[0]):
+        return np.nan, np.nan, {"psf_status": "outside_cutout"}
 
     if (not cfg.enable_psf_local_grid_search) or detector not in tuple(cfg.psf_grid_search_enabled_detectors):
         psf_kernel = extract_spherex_psf_kernel(hdul_like, x, y, cfg)
-        flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg)
+        flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg, normalize_psf="EPSF" not in hdul_like)
         info = dict(info)
         info.update({
             "psf_grid_status": "disabled",
@@ -1881,6 +2258,7 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
                     y_try,
                     psf_kernel,
                     cfg,
+                    normalize_psf="EPSF" not in hdul_like,
                 )
             except Exception as exc:
                 continue
@@ -1908,7 +2286,7 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
         # Fall back to the unshifted position.
         try:
             psf_kernel = extract_spherex_psf_kernel(hdul_like, x, y, cfg)
-            flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg)
+            flux_uJy, err_uJy, info = psf_flux_fit(flux_ujy, var_ujy2, flags, x, y, psf_kernel, cfg, normalize_psf="EPSF" not in hdul_like)
         except Exception as exc:
             return np.nan, np.nan, {
                 "psf_status": f"psf_error:{type(exc).__name__}",
@@ -1954,88 +2332,89 @@ def psf_flux_fit_with_local_grid_search(hdul_like, flux_ujy, var_ujy2, flags, x,
 
 
 def aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius_pix,
-                             cfg: PipelineConfig, remove_known_sources=True):
-    """
-    Measure background-subtracted circular-aperture flux for one cutout.
+                             cfg: PipelineConfig, remove_known_sources=True, *, return_info=False):
+    """Background-subtracted aperture flux, with explicit missing-source policy.
 
-    The input image is already in uJy per pixel. The local background is
-    estimated in an annulus, optionally sigma-clipped, then subtracted from the
-    aperture sum. Negative fluxes are kept by default because they are valid
-    noisy measurements for faint sources.
+    The default four-value return is retained. return_info=True appends quality
+    diagnostics. Missing source flux is never silently aperture-corrected.
     """
+    uses_epsf = get_runtime_data_release(cfg, cfg.data_release or "unknown") in EPSF_RELEASES
+    policy = cfg.aperture_masked_policy or ("reject" if uses_epsf else "allow")
+    if policy not in ("reject", "allow"):
+        raise ValueError("aperture_masked_policy must be reject or allow")
+    info = {"aperture_status": "bad_position", "aperture_masked_fraction": np.nan,
+            "aperture_coverage_fraction": np.nan, "background_npix": 0,
+            "background_status": "not_run", "background_source_mask_relaxed": False,
+            "aperture_missing_flux_allowed": False, "aperture_masked_policy": policy}
+    n_bad = 0
+    def finish(flux=np.nan, error=np.nan, area=np.nan):
+        result = (flux, error, area, n_bad)
+        return (*result, dict(info)) if return_info else result
     if not np.isfinite(x) or not np.isfinite(y):
-        return np.nan, np.nan, np.nan, 0
+        return finish()
     ny, nx = flux_ujy.shape
-    if x < 0 or y < 0 or x >= nx or y >= ny:
-        return np.nan, np.nan, np.nan, 0
-
+    if not (0 <= x < nx and 0 <= y < ny):
+        return finish()
     r = float(radius_pix)
     aperture = CircularAperture((x, y), r=r)
-    annulus = CircularAnnulus((x, y), r_in=cfg.annulus_inner_scale * r, r_out=cfg.annulus_outer_scale * r)
-
-    bad_mask = make_bad_pixel_mask(flags, flux_ujy, cfg.bad_flag_bits)
-
-    if remove_known_sources:
-        bkg_mask = make_bad_pixel_mask(flags, flux_ujy, cfg.bad_flag_bits + (21,))
-    else:
-        bkg_mask = bad_mask
-
-    sigclip = SigmaClip(sigma=cfg.sigma_clip_sigma, maxiters=cfg.sigma_clip_maxiters)
-    stats = ApertureStats(flux_ujy, annulus, mask=bkg_mask, sigma_clip=sigclip)
-
-    if cfg.bg_method == "mean":
-        bkg_per_pix = stats.mean
-    elif cfg.bg_method == "median":
-        bkg_per_pix = stats.median
-    elif cfg.bg_method == "mode":
-        bkg_per_pix = stats.mode
-    else:
-        raise ValueError(f"Unsupported background method: {cfg.bg_method}")
-
-    if bkg_per_pix is None or not np.isfinite(bkg_per_pix):
-        if remove_known_sources:
-            return aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius_pix, cfg,
-                                            remove_known_sources=False)
-        return np.nan, np.nan, np.nan, count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
-    ap_weight = aperture.to_mask(method="exact").to_image(flux_ujy.shape)
-    if ap_weight is None:
-        return np.nan, np.nan, np.nan, count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
-    valid_weight = np.where(bad_mask, 0.0, ap_weight)
-    ap_area = float(np.nansum(valid_weight))
-    if not np.isfinite(ap_area) or ap_area <= 0:
-        return np.nan, np.nan, np.nan, count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
-    phot = aperture_photometry(flux_ujy, aperture, mask=bad_mask, method="exact")
-    flux = float(phot["aperture_sum"][0]) - float(bkg_per_pix) * ap_area
-
+    annulus = CircularAnnulus((x, y), r_in=cfg.annulus_inner_scale*r, r_out=cfg.annulus_outer_scale*r)
+    source_bits = resolved_flag_bits(cfg)
+    background_bits = resolved_flag_bits(cfg, "background")
+    info["background_exclusion_mask"] = bitmask(background_bits)
+    n_bad = count_bad_aperture_flags(flags, x, y, r, resolved_flag_bits(cfg, "warning"))
+    bad_mask = make_bad_pixel_mask(flags, flux_ujy, source_bits)
     if var_ujy2 is not None:
-        var_mask = bad_mask | ~np.isfinite(var_ujy2)
-        vtab = aperture_photometry(var_ujy2, aperture, mask=var_mask, method="exact")
-        var_sum = float(vtab["aperture_sum"][0])
+        bad_mask |= ~np.isfinite(var_ujy2) | (var_ujy2 <= 0)
+    weights = aperture.to_mask(method="exact").to_image(flux_ujy.shape)
+    if weights is None:
+        return finish()
+    nominal_area = np.pi*r*r
+    observed_area = float(weights.sum())
+    valid_area = float(np.where(bad_mask, 0., weights).sum())
+    lost_area = max(0., nominal_area-valid_area)
+    info.update(aperture_coverage_fraction=observed_area/nominal_area,
+                aperture_masked_fraction=lost_area/nominal_area)
+    if valid_area <= 0 or (policy == "reject" and lost_area > nominal_area*1.e-8):
+        info["aperture_status"] = "rejected_missing_source_pixels"
+        return finish(area=valid_area)
+    info["aperture_missing_flux_allowed"] = lost_area > nominal_area*1.e-8
+    sigclip = SigmaClip(sigma=cfg.sigma_clip_sigma, maxiters=cfg.sigma_clip_maxiters)
+    def background(use_source_mask):
+        bits = background_bits if use_source_mask else tuple(b for b in background_bits if b != 21)
+        mask = make_bad_pixel_mask(flags, flux_ujy, bits)
+        info["background_exclusion_mask"] = bitmask(bits)
+        stats = ApertureStats(flux_ujy, annulus, mask=mask, sigma_clip=sigclip)
+        estimate = getattr(stats, cfg.bg_method)
+        # data_cutout includes geometric center masking, caller mask, NaNs and
+        # the actual sigma-clip rejection; count precisely those surviving pixels.
+        count = int(np.ma.count(stats.data_cutout))
+        return stats, estimate, count
+    stats, bkg, n_bg = background(remove_known_sources)
+    info["background_source_mask_relaxed"] = not remove_known_sources and 21 in background_bits
+    allow_fallback = cfg.allow_source_background_fallback
+    if allow_fallback is None:
+        allow_fallback = not uses_epsf
+    if (bkg is None or not np.isfinite(bkg) or n_bg == 0) and remove_known_sources and allow_fallback and 21 in background_bits:
+        stats, bkg, n_bg = background(False)
+        info["background_source_mask_relaxed"] = True
+    info["background_npix"] = n_bg
+    if bkg is None or not np.isfinite(bkg) or n_bg == 0:
+        info.update(aperture_status="bad_background", background_status="unusable")
+        return finish(area=valid_area)
+    info["background_status"] = "source_mask_relaxed" if info["background_source_mask_relaxed"] else "ok"
+    phot = aperture_photometry(flux_ujy, aperture, mask=bad_mask, method="exact")
+    flux = float(phot["aperture_sum"][0])-float(bkg)*valid_area
+    if var_ujy2 is not None:
+        var_sum = float(aperture_photometry(var_ujy2, aperture, mask=bad_mask, method="exact")["aperture_sum"][0])
     else:
-        var_sum = 0.0
-
-    ann_mask_img = annulus.to_mask(method="center").to_image(flux_ujy.shape)
-    n_bg = int(np.count_nonzero((ann_mask_img > 0) & (~bad_mask))) if ann_mask_img is not None else 0
-
-    if n_bg > 0 and stats.std is not None and np.isfinite(stats.std):
-        var_bkg_per_pix = float(stats.std) ** 2 / n_bg
-    else:
-        var_bkg_per_pix = 0.0
-
-    if var_ujy2 is None and stats.std is not None and np.isfinite(stats.std):
-        var_sum = float(stats.std) ** 2 * ap_area
-
-    total_var = var_sum + ap_area ** 2 * var_bkg_per_pix
-    err = float(np.sqrt(total_var)) if total_var >= 0 else np.nan
-    n_bad = count_bad_aperture_flags(flags, x, y, r, cfg.aperture_flag_count_bits)
-
+        var_sum = float(stats.std)**2*valid_area
+    var_background = float(stats.std)**2/n_bg
+    error = float(np.sqrt(var_sum+valid_area**2*var_background))
     if flux < 0 and not cfg.keep_negative_flux:
-        flux, err = np.nan, np.nan
-
-    return flux, err, ap_area, n_bad
+        info["aperture_status"] = "rejected_negative_flux"
+        return finish(area=valid_area)
+    info["aperture_status"] = "partial_source_flux" if info["aperture_missing_flux_allowed"] else "ok"
+    return finish(flux, error, valid_area)
 
 
 def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) -> list[dict]:
@@ -2054,11 +2433,18 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
         data_release = infer_data_release_from_header(header)
     if data_release == "unknown":
         raise ValueError("Cannot measure cutout because the SPHEREx data release is unknown.")
+    cfg = replace(cfg)
+    set_runtime_data_release(cfg, data_release)
+    require_supported_photometry(data_release, cfg)
 
     sapm_key = (data_release, detector)
     if sapm_key not in sapm_cache:
         sapm_cache[sapm_key] = load_sapm(detector, cfg, data_release)
     sapm_data, sapm_header = sapm_cache[sapm_key]
+    if data_release in EPSF_RELEASES:
+        qr3_parent_coordinates(header, image.shape, sapm_data.shape)
+        if sapm_header.get("DETCOORD", "").strip().lower() != "sky":
+            raise ValueError(f"{data_release.upper()} pixel-area map must use sky detector coordinates.")
 
     sapm_use, image_slices, sapm_info = extract_sapm_for_cutout(
         sapm_data,
@@ -2092,9 +2478,12 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
 
     if method in ("aperture", "both"):
         for radius in get_aperture_radii_for_detector(cfg, detector):
-            flux_uJy, err_uJy, area_pix, n_bad = aperture_flux_one_radius(flux_ujy, var_ujy2, flags, x, y, radius, cfg)
+            flux_uJy, err_uJy, area_pix, n_bad, aperture_info = aperture_flux_one_radius(
+                flux_ujy, var_ujy2, flags, x, y, radius, cfg, return_info=True)
             measurements.append({
                 "wavelength": float(row["central_wavelength_um"]),
+                "bandwidth_um": row.get("bandwidth_um", np.nan),
+                "wavelength_source": row.get("wavelength_source", "WCS-WAVE"),
                 "flux": flux_uJy * 1e-6 if np.isfinite(flux_uJy) else np.nan,
                 "err": err_uJy * 1e-6 if np.isfinite(err_uJy) else np.nan,
                 "flux_uJy": flux_uJy,
@@ -2120,6 +2509,9 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
                 "epoch_projection_status": row.get("epoch_projection_status", ""),
                 "epoch_projection_sep_arcsec": row.get("epoch_projection_sep_arcsec", np.nan),
                 **sapm_info,
+                **aperture_info,
+                "warning_flags": source_warning_flags(flags, x, y),
+                "source_exclusion_mask": bitmask(resolved_flag_bits(cfg)),
                 "status": "ok" if np.isfinite(flux_uJy) and np.isfinite(err_uJy) and err_uJy > 0 else "bad_photometry",
             })
 
@@ -2129,9 +2521,18 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
         psf_info = {"psf_status": "not_run"}
 
         try:
-            if row.get("psf_hdu") is None:
-                raise ValueError("No PSF HDU available.")
-            hdul_like = fits.HDUList([fits.PrimaryHDU(), image_hdu, row["psf_hdu"]])
+            model_hdu = row.get("epsf_hdu") if data_release in EPSF_RELEASES else row.get("psf_hdu")
+            if model_hdu is None:
+                raise ValueError("No appropriate PSF/EPSF HDU available.")
+            fit_image = image_hdu
+            if data_release in EPSF_RELEASES:
+                fit_header = header.copy()
+                fit_header["CRPIX1A"] = float(header.get("CRPIX1A", 1)) - image_slices[1].start
+                fit_header["CRPIX2A"] = float(header.get("CRPIX2A", 1)) - image_slices[0].start
+                fit_image = fits.ImageHDU(image, header=fit_header, name="IMAGE")
+            hdul_like = fits.HDUList([fits.PrimaryHDU(), fit_image, model_hdu])
+            if data_release in EPSF_RELEASES:
+                extract_spherex_epsf_kernel(hdul_like, x, y, cfg)
             psf_flux_uJy, psf_err_uJy, psf_info = psf_flux_fit_with_local_grid_search(
                 hdul_like,
                 flux_ujy,
@@ -2142,11 +2543,22 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
                 detector=detector,
                 cfg=cfg,
             )
+            if data_release in EPSF_RELEASES and np.isfinite(psf_flux_uJy):
+                index, ovs = select_epsf_zone(hdul_like, psf_info['psf_x_fit'], psf_info['psf_y_fit'])
+                zone = model_hdu.data[index]
+                psf_info.update({"psf_model": "EPSF", "epsf_reference": row.get("epsf_reference", ""),
+                                 "epsf_binx": int(zone['BINX']),
+                                 "epsf_biny": int(zone['BINY']), "epsf_oversamp_x": ovs[1],
+                                 "epsf_oversamp_y": ovs[0]})
         except Exception as exc:
+            if data_release in EPSF_RELEASES:
+                raise ValueError(f"{data_release.upper()} EPSF photometry failed: {exc}") from exc
             psf_info = {"psf_status": f"psf_error:{type(exc).__name__}"}
 
         measurements.append({
             "wavelength": float(row["central_wavelength_um"]),
+            "bandwidth_um": row.get("bandwidth_um", np.nan),
+            "wavelength_source": row.get("wavelength_source", "WCS-WAVE"),
             "flux": psf_flux_uJy * 1e-6 if np.isfinite(psf_flux_uJy) else np.nan,
             "err": psf_err_uJy * 1e-6 if np.isfinite(psf_err_uJy) else np.nan,
             "flux_uJy": psf_flux_uJy,
@@ -2157,10 +2569,10 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
             "aperture_area_pix": np.nan,
             "n_bad_aperture_pixels": count_bad_aperture_flags(
                 flags,
-                x,
-                y,
+                psf_info.get("psf_x_fit", x),
+                psf_info.get("psf_y_fit", y),
                 get_selected_aperture_radius_pix(cfg, detector),
-                cfg.aperture_flag_count_bits,
+                resolved_flag_bits(cfg, "warning"),
             ),
             "x": psf_info.get("psf_x_fit", x),
             "y": psf_info.get("psf_y_fit", y),
@@ -2182,6 +2594,8 @@ def measure_cutout_photometry(row: dict, sapm_cache: dict, cfg: PipelineConfig) 
             **sapm_info,
             "status": "ok" if np.isfinite(psf_flux_uJy) and np.isfinite(psf_err_uJy) and psf_err_uJy > 0 and psf_info.get("psf_status") == "ok" else "bad_photometry",
             **psf_info,
+            "warning_flags": source_warning_flags(flags, psf_info.get("psf_x_fit", x), psf_info.get("psf_y_fit", y)),
+            "source_exclusion_mask": bitmask(resolved_flag_bits(cfg)),
         })
 
     return measurements
@@ -2254,8 +2668,7 @@ def get_spectral_channels_cache_dir(cfg: PipelineConfig, data_release: str) -> P
     if release == "unknown":
         raise ValueError("Cannot choose spectral_channels cache directory because the SPHEREx data release is unknown.")
     path = Path(cfg.spectral_channels_cache_dir) / release
-    if cfg.spectral_channels_collection:
-        path = path / cfg.spectral_channels_collection
+    path = path / calibration_collection(cfg, release, "spectral_channels")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -2264,20 +2677,19 @@ def _default_spectral_channels_s3_candidates(cfg: PipelineConfig, data_release: 
     """
     Build candidate S3 paths for the spectral_channels calibration file.
 
-    Because SPHEREx calibration collection names may change, this only generates
-    default candidates when cfg.spectral_channels_collection is supplied.
+    Use the release-specific collection unless the caller supplies an override.
     """
     release = normalize_data_release(data_release)
     if release == "unknown":
         return []
-    coll = cfg.spectral_channels_collection
+    coll = calibration_collection(cfg, data_release, "spectral_channels")
     if not coll:
         return []
 
     return [
         (
             f"nasa-irsa-spherex/{release}/spectral_channels/"
-            f"{coll}/spectral_channels_spx_{coll}.fits.gz"
+            f"{coll}/spectral_channels_spx_{coll}.fits" + ("" if release in EPSF_RELEASES else ".gz")
         ),
         (
             f"nasa-irsa-spherex/{release}/spectral_channels/"
@@ -2295,7 +2707,7 @@ def _render_spectral_channels_template(cfg: PipelineConfig, data_release: str) -
         return None
     return cfg.spectral_channels_s3_template.format(
         data_release=release,
-        collection=cfg.spectral_channels_collection or "",
+        collection=calibration_collection(cfg, release, "spectral_channels"),
     )
 
 
@@ -2305,15 +2717,18 @@ def load_spectral_channels_calibration(cfg: PipelineConfig, data_release: str | 
 
     Returns an astropy Table when possible, otherwise None.
     """
-    release = get_runtime_data_release(cfg, data_release or "unknown")
+    release = (normalize_data_release(data_release) if data_release is not None
+               else get_runtime_data_release(cfg))
     if release == "unknown":
-        logging.warning("Cannot load spectral_channels calibration because the SPHEREx data release is unknown.")
-        return None
+        raise ValueError("Cannot load spectral_channels calibration: unknown SPHEREx data release.")
     cache_dir = get_spectral_channels_cache_dir(cfg, release)
 
     local_candidates = sorted(cache_dir.glob("*.fits")) + sorted(cache_dir.glob("*.fits.gz"))
     if local_candidates and not cfg.redownload_spectral_channels:
-        return read_spectral_channels_file(local_candidates[0])
+        table = read_spectral_channels_file(local_candidates[0])
+        if table is None and release in EPSF_RELEASES:
+            raise ValueError(f"Cached {release.upper()} spectral-channel file has no channel table.")
+        return table
 
     candidates = []
     rendered = _render_spectral_channels_template(cfg, release)
@@ -2324,20 +2739,17 @@ def load_spectral_channels_calibration(cfg: PipelineConfig, data_release: str | 
 
     for s3_path in candidates:
         local_path = cache_dir / Path(s3_path).name
-        tmp_path = local_path.with_suffix(local_path.suffix + ".part")
         try:
-            with fits.open(f"s3://{s3_path}", fsspec_kwargs={"anon": True}) as hdul:
-                hdul.writeto(tmp_path, overwrite=True)
-            tmp_path.replace(local_path)
-            return read_spectral_channels_file(local_path)
+            download_calibration(s3_path, local_path, cfg.request_timeout_sec)
+            table = read_spectral_channels_file(local_path)
+            if table is None and release in EPSF_RELEASES:
+                raise ValueError(f"{release.upper()} spectral-channel file has no channel table.")
+            return table
         except Exception as exc:
             logging.warning("Could not load spectral_channels from %s: %s", s3_path, exc)
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
 
+    if release in EPSF_RELEASES:
+        raise RuntimeError(f"Could not load {release.upper()} spectral-channel calibration.")
     return None
 
 
@@ -2398,18 +2810,18 @@ def spectral_channel_edges_for_detector(table: Table, detector: int):
         return None, None
 
     det_col = _find_column_name(table, ("DETECTOR", "DET", "BAND"))
-    ch_col = _find_column_name(table, ("CHANNEL", "CHAN", "CH", "CHANNEL_ID"))
+    ch_col = _find_column_name(table, ("CHANNEL", "CHAN", "CH", "CHANNEL_ID", "SUBCHAN"))
     center_col = _find_column_name(
         table,
         ("WAVELENGTH", "WAVE", "LAMBDA", "LAMBDA_C", "WAVECEN", "WAVE_CEN", "LAMBDA_CEN", "WAVE_CENTER")
     )
     lo_col = _find_column_name(
         table,
-        ("WAVE_MIN", "LAMBDA_MIN", "WAVEMIN", "LAM_MIN", "WAVE_LO", "LAMBDA_LO", "WAVELENGTH_MIN")
+        ("WAVE_MIN", "LAMBDA_MIN", "WAVEMIN", "LAM_MIN", "WAVE_LO", "LAMBDA_LO", "WAVELENGTH_MIN", "WL_MIN")
     )
     hi_col = _find_column_name(
         table,
-        ("WAVE_MAX", "LAMBDA_MAX", "WAVEMAX", "LAM_MAX", "WAVE_HI", "LAMBDA_HI", "WAVELENGTH_MAX")
+        ("WAVE_MAX", "LAMBDA_MAX", "WAVEMAX", "LAM_MAX", "WAVE_HI", "LAMBDA_HI", "WAVELENGTH_MAX", "WL_MAX")
     )
 
     det_specific_col = _find_column_name(
@@ -2451,8 +2863,19 @@ def spectral_channel_edges_for_detector(table: Table, detector: int):
             return None, None
         order = np.argsort(0.5 * (lo + hi))
         lo, hi = lo[order], hi[order]
-        centers = 0.5 * (lo + hi)
-        edges = np.concatenate([[lo[0]], hi])
+        centers = (np.asarray(rows[center_col], dtype=float)[good][order]
+                   if center_col is not None else 0.5 * (lo + hi))
+        if not np.all(np.isfinite(centers)) or not np.all(np.diff(centers) > 0):
+            raise ValueError("Spectral channel centers must be finite and increasing.")
+        if "WL_MIN" in rows.colnames and "WL_MAX" in rows.colnames:
+            # These are wavelength envelopes of geometrically defined channels;
+            # adjacent envelopes overlap. Partition their common region once.
+            internal = 0.5 * (hi[:-1] + lo[1:])
+            edges = np.concatenate([[lo[0]], internal, [hi[-1]]])
+        else:
+            edges = np.concatenate([[lo[0]], hi])
+        if not np.all(np.diff(edges) > 0):
+            raise ValueError("Spectral channel boundaries must be increasing.")
         return edges, centers
 
     if center_col is not None:
@@ -2618,6 +3041,8 @@ def reduce_oversampling_with_spectral_channels(wl, flux, err, det, channels_tabl
         edges, centers = spectral_channel_edges_for_detector(channels_table, det_num_int)
 
         if edges is None or centers is None or len(edges) < 2:
+            if get_runtime_data_release(cfg, cfg.data_release or "unknown") in EPSF_RELEASES:
+                raise ValueError(f"Spectral-channel calibration missing detector {det_num_int}.")
             fallback_wl.extend(wl_d)
             fallback_flux.extend(flux_d)
             fallback_err.extend(err_d)
@@ -2847,6 +3272,8 @@ def process_spectrum_table(spec: Table, cfg: PipelineConfig, reduce_oversampling
                 )
                 if len(wl2) > 0:
                     wl, flux, err, det = wl2, flux2, err2, det2
+                elif get_runtime_data_release(cfg, cfg.data_release or "unknown") in EPSF_RELEASES:
+                    logging.warning("Spectral-channel binning produced no points; retaining unbinned measurements.")
                 else:
                     logging.warning("spectral_channels binning produced no points; falling back to hard-coded bins.")
                     wl, flux, err, det = reduce_oversampling_per_detector(wl, flux, err, det)
@@ -3024,6 +3451,13 @@ def save_spectrum_fits(
     data_release = get_runtime_data_release(cfg)
     if data_release != "unknown":
         hdu0.header["DATAREL"] = data_release
+    if data_release != "unknown":
+        hdu0.header["SAPMCOLL"] = calibration_collection(cfg, data_release, "sapm")
+    if data_release in EPSF_RELEASES:
+        hdu0.header["SWCSCOLL"] = calibration_collection(cfg, data_release, "spectral_wcs")
+        hdu0.header["WAVESRC"] = "CWAVE"
+    if data_release != "unknown" and cfg.reduce_oversampling and cfg.use_spectral_channels_for_binning:
+        hdu0.header["SCHCOLL"] = calibration_collection(cfg, data_release, "spectral_channels")
     hdu0.header["TARGET"] = f"{ra:.6f},{dec:.6f}"
     hdu0.header["REFRA"] = (float(ra), "Input reference RA [deg]")
     hdu0.header["REFDEC"] = (float(dec), "Input reference Dec [deg]")
@@ -3034,6 +3468,21 @@ def save_spectrum_fits(
     if cfg.pmdec_masyr is not None:
         hdu0.header["PMDEC"] = (float(cfg.pmdec_masyr), "Proper motion Dec [mas/yr]")
     hdu0.header["PHOTMET"] = (method, "Photometry method used for this spectrum")
+    hdu0.header["SRCMASK"] = bitmask(resolved_flag_bits(cfg))
+    hdu0.header["BGMASK"] = bitmask(resolved_flag_bits(cfg, "background"))
+    if method == "aperture":
+        hdu0.header["APMASK"] = cfg.aperture_masked_policy or ("reject" if data_release in EPSF_RELEASES else "allow")
+        hdu0.header["BGCOUNT"] = ("MASKCLIP", "Count surviving annulus samples after masking/clipping")
+        hdu0.header["BGSRCFB"] = (cfg.allow_source_background_fallback if cfg.allow_source_background_fallback is not None else data_release not in EPSF_RELEASES)
+    if data_release in EPSF_RELEASES and method == "psf":
+        hdu0.header["PSFMODEL"] = "EPSF"
+        hdu0.header["PSFNORM"] = ("FULL", "Normalize native full model before fit-window clipping")
+        hdu0.header["ERRTYPE"] = ("FORMAL", "Fit covariance; no archive systematic floor added")
+        references = getattr(cfg, "_epsf_references", [])
+        if references:
+            hdu0.header["EPSFREF"] = references[0] if len(references) == 1 else "MULTIPLE"
+            for reference in references:
+                hdu0.header.add_history(f"Embedded EPSF calibration: {reference}")
     if coord_stats is not None:
         add_epoch_adjusted_coordinate_header(hdu0.header, coord_stats)
 
@@ -3391,14 +3840,23 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
     """Run the full SPHEREx extraction workflow and return the processed spectrum table."""
     if cfg is None:
         cfg = PipelineConfig()
+    cfg = replace(cfg)
     validate_config(cfg)
+    if cfg.data_release is not None:
+        set_runtime_data_release(cfg, cfg.data_release)
     object_name = make_object_name(ra, dec, object_name)
-    ensure_output_directories(cfg.output_dir)
 
     if cfg.query_irsa_for_cutouts:
+        require_supported_photometry(normalize_data_release(cfg.data_release), cfg)
         print("Querying SPHEREx cutouts...")
         cutout_table = query_spherex_cutouts(ra, dec, cfg)
         print(f"Found {len(cutout_table)} cutouts")
+        query_release = require_single_data_release([
+            {"data_release": infer_data_release_from_uri(str(row["uri"]))}
+            for row in cutout_table
+        ], cfg.data_release)
+        require_supported_photometry(query_release, cfg)
+        set_runtime_data_release(cfg, query_release)
 
         print("Downloading/caching cutouts...")
         prepared_rows = download_cutout_files_parallel(cutout_table, object_name, cfg, ra=ra, dec=dec)
@@ -3417,9 +3875,27 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
             print(f"SPHEREx data release inferred from cached file paths: {prepared_release.upper()}")
             set_runtime_data_release(cfg, prepared_release)
 
+    release = require_single_data_release(prepared_rows, cfg.data_release)
+    set_runtime_data_release(cfg, release)
+    require_supported_photometry(release, cfg)
+    cfg.output_dir = str(Path(cfg.output_dir) / release)
+    ensure_output_directories(cfg.output_dir)
     print("Opening cached cutouts...")
     cutouts = open_cutouts_parallel(prepared_rows, ra, dec, cfg)
     good_cutouts = [r for r in cutouts if "image_hdu" in r]
+    if release in EPSF_RELEASES:
+        failed_cutouts = [
+            r for r in cutouts if "image_hdu" not in r and r.get("status") != "skipped_outside_detector"
+        ]
+        if failed_cutouts:
+            errors = [r.get("open_error", r.get("status", "unknown")) for r in failed_cutouts]
+            raise RuntimeError(f"{release.upper()} cutout/calibration preparation failed: {errors}")
+        skipped = len(cutouts) - len(good_cutouts)
+        if skipped:
+            print(f"Skipped {skipped} cutouts where the source lies outside the detector calibration grid.")
+            if not good_cutouts:
+                raise RuntimeError(f"No usable {release.upper()} cutouts: the source lies outside the detector calibration grid in all {skipped}.")
+    require_single_data_release(good_cutouts, release)
     opened_release = infer_unique_data_release(good_cutouts)
     if opened_release not in ("unknown", "mixed"):
         set_runtime_data_release(cfg, opened_release)
@@ -3430,6 +3906,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
         print("WARNING: could not infer SPHEREx data release from opened cutouts.")
     print(f"Opened {len(good_cutouts)} usable cutouts")
 
+    cfg._epsf_references = sorted({r["epsf_reference"] for r in good_cutouts if r.get("epsf_reference")})
     coord_stats = compute_epoch_adjusted_coordinate_stats(good_cutouts)
     print_epoch_adjusted_coordinate_stats(coord_stats)
 
@@ -3472,6 +3949,9 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
         unbinned_plot_spec = process_spectrum_table(raw_spec, cfg, reduce_oversampling_override=False)
         final_spec = process_spectrum_table(raw_spec, cfg)
         final_specs[method] = final_spec
+        if len(final_spec) == 0:
+            logging.warning("No usable %s spectrum points for %s. Check the cutout and photometry diagnostics.",
+                            method, object_name)
         save_spectrum_fits(
             final_spec,
             ra,

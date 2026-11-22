@@ -1,0 +1,72 @@
+{
+  "target": {
+    "name": "SIMP_J013656_validation",
+    "ra": 24.2412498,
+    "dec": 9.5630705,
+    "reference_epoch_yr": 2016.0,
+    "pmra_masyr": 1238.244,
+    "pmdec_masyr": -16.156
+  },
+  "cases": [
+    {
+      "release": "qr2",
+      "detector": 1,
+      "uri": "ibe/data/spherex/qr2/level2/2025W28_2A/l2b-v20-2025-260/1/level2_2025W28_2A_0321_1D1_spx_l2b-v20-2025-260.fits"
+    },
+    {
+      "release": "qr2",
+      "detector": 2,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_2B/l2b-v20-2025-262/2/level2_2025W30_2B_0227_3D2_spx_l2b-v20-2025-262.fits"
+    },
+    {
+      "release": "qr2",
+      "detector": 3,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_1B/l2b-v20-2025-262/3/level2_2025W30_1B_0212_1D3_spx_l2b-v20-2025-262.fits"
+    },
+    {
+      "release": "qr2",
+      "detector": 4,
+      "uri": "ibe/data/spherex/qr2/level2/2025W28_2A/l2b-v20-2025-260/4/level2_2025W28_2A_0321_1D4_spx_l2b-v20-2025-260.fits"
+    },
+    {
+      "release": "qr2",
+      "detector": 5,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_2B/l2b-v20-2025-262/5/level2_2025W30_2B_0227_3D5_spx_l2b-v20-2025-262.fits"
+    },
+    {
+      "release": "qr2",
+      "detector": 6,
+      "uri": "ibe/data/spherex/qr2/level2/2025W30_2B/l2b-v20-2025-262/6/level2_2025W30_2B_0239_4D6_spx_l2b-v20-2025-262.fits"
+    },
+    {
+      "release": "qr3",
+      "detector": 1,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/1/level2_2026W30_1B_0244_1D1_spx_l2b-v27-2026-222.fits"
+    },
+    {
+      "release": "qr3",
+      "detector": 2,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/2/level2_2026W30_1B_0050_1D2_spx_l2b-v27-2026-222.fits"
+    },
+    {
+      "release": "qr3",
+      "detector": 3,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/3/level2_2026W30_1B_0022_1D3_spx_l2b-v27-2026-222.fits"
+    },
+    {
+      "release": "qr3",
+      "detector": 4,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/4/level2_2026W30_1B_0244_1D4_spx_l2b-v27-2026-222.fits"
+    },
+    {
+      "release": "qr3",
+      "detector": 5,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/5/level2_2026W30_1B_0050_1D5_spx_l2b-v27-2026-222.fits"
+    },
+    {
+      "release": "qr3",
+      "detector": 6,
+      "uri": "ibe/data/spherex/qr3/level2/2026W30_1B/l2b-v27-2026-222/6/level2_2026W30_1B_0022_1D6_spx_l2b-v27-2026-222.fits"
+    }
+  ]
+}

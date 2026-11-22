@@ -1,3 +1,7 @@
+"""Plot the bundled QR2 standards; run from src/. Outputs are kept separate.
+
+Regenerate a matched QR3 standard library before using these sequences for QR3.
+"""
 import os
 import warnings
 
@@ -354,5 +358,7 @@ fig.add_artist(Rectangle(
 ))
 
 plt.tight_layout()
-plt.savefig("../resources/standards/sequence/" + file_name, dpi=300, bbox_inches="tight")
+output_dir = "../outputs/standards/qr2/sequence"
+os.makedirs(output_dir, exist_ok=True)
+plt.savefig(os.path.join(output_dir, file_name), dpi=300, bbox_inches="tight")
 plt.close()
