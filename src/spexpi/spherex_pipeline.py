@@ -3225,7 +3225,13 @@ def reduce_oversampling_per_detector(wl, flux, err, det):
     return tuple(map(np.array, out))
 
 
-def build_spectrum_table(measurements: list[dict], aperture_radius_pix: float | Mapping[int, float] | None, photometry_method: str = "aperture") -> Table:
+def build_spectrum_table(
+    measurements: list[dict],
+    aperture_radius_pix: float | Mapping[int, float] | None,
+    photometry_method: str = "aperture",
+    *,
+    include_release: bool = False,
+) -> Table:
     """Select valid measurements and return a wavelength-sorted raw spectrum table.
 
     For aperture spectra, ``aperture_radius_pix`` may be either a single radius
@@ -3249,7 +3255,10 @@ def build_spectrum_table(measurements: list[dict], aperture_radius_pix: float | 
     err = np.array([r["err"] for r in rows])
     det = np.array([r["detector"] for r in rows])
     order = np.argsort(wl)
-    return Table([wl[order], flux[order], err[order], det[order]], names=("WAVELENGTH", "FLUX", "ERR", "DETECTOR"))
+    spec = Table([wl[order], flux[order], err[order], det[order]], names=("WAVELENGTH", "FLUX", "ERR", "DETECTOR"))
+    if include_release:
+        spec["DATAREL"] = np.asarray([r["data_release"] for r in rows])[order]
+    return spec
 
 
 def process_spectrum_table(spec: Table, cfg: PipelineConfig, reduce_oversampling_override: bool | None = None) -> Table:
@@ -3263,15 +3272,33 @@ def process_spectrum_table(spec: Table, cfg: PipelineConfig, reduce_oversampling
     if len(spec) == 0:
         return spec
     wl, flux, err, det = [np.asarray(spec[name]) for name in ("WAVELENGTH", "FLUX", "ERR", "DETECTOR")]
+    keep = np.ones(len(spec), dtype=bool)
     if cfg.clip_flux_at_wavelength is not None:
-        keep = wl >= float(cfg.clip_flux_at_wavelength)
-        wl, flux, err, det = wl[keep], flux[keep], err[keep], det[keep]
+        keep &= wl >= float(cfg.clip_flux_at_wavelength)
     if cfg.sanitize_flux:
         # Keep negative fluxes, but remove non-finite values, zero placeholders, and invalid uncertainties.
-        good = np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err > 0) & (flux != 0)
-        wl, flux, err, det = wl[good], flux[good], err[good], det[good]
+        keep &= np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err > 0) & (flux != 0)
+    wl, flux, err, det = wl[keep], flux[keep], err[keep], det[keep]
     if cfg.remove_outliers:
-        wl, flux, err, det = remove_outliers_per_detector(wl, flux, err, det, cfg.outlier_detectors, cfg.outlier_nbr_of_bins, cfg.outlier_sigma)
+        settings = (cfg.outlier_detectors, cfg.outlier_nbr_of_bins, cfg.outlier_sigma)
+        if cfg.combine_dr1_qr3:
+            releases = np.asarray(spec["DATAREL"])[keep]
+            # Coarse detector bins can sample different parts of a spectral feature
+            # in each release. Use each release's own MAD before joint binning.
+            clipped = []
+            for release in np.unique(releases):
+                mask = releases == release
+                if release not in EPSF_RELEASES:
+                    raise ValueError(f"Unexpected spectrum measurement release: {release}")
+                result = remove_outliers_per_detector(wl[mask], flux[mask], err[mask], det[mask], *settings)
+                if len(result[0]):
+                    clipped.append(result)
+            if clipped:
+                wl, flux, err, det = (np.concatenate(values) for values in zip(*clipped))
+            else:
+                wl, flux, err, det = wl[:0], flux[:0], err[:0], det[:0]
+        else:
+            wl, flux, err, det = remove_outliers_per_detector(wl, flux, err, det, *settings)
 
     do_reduce_oversampling = cfg.reduce_oversampling if reduce_oversampling_override is None else bool(reduce_oversampling_override)
     if do_reduce_oversampling:
@@ -3992,6 +4019,7 @@ def run_spherex_pipeline(ra: float, dec: float, object_name: str | None = None, 
             measurements,
             selected_aperture,
             photometry_method=method,
+            include_release=cfg.combine_dr1_qr3 and cfg.remove_outliers,
         )
         # This is the true unbinned comparison layer: same clipping/sanitation/outlier
         # handling as the final spectrum, but explicitly before oversampling reduction.

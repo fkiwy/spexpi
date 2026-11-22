@@ -224,7 +224,9 @@ Online runs query the two releases separately. With
 caches. Both releases must supply usable cutouts. Each exposure uses
 its own release's calibrations, and joint channel binning checks that
 both releases define identical channel edges and centers. The example
-uses inverse-variance weighting within each channel.
+uses inverse-variance weighting within each channel. With
+`remove_outliers=True`, the pipeline clips each release separately before
+combining the surviving measurements.
 
 Products go under `output_dir/dr1+qr3/`. Spectrum FITS headers record
 `DATAREL=dr1+qr3`, and the measurements FITS table is always saved in

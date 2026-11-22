@@ -103,7 +103,7 @@ class QR3ApertureTests(unittest.TestCase):
             channels.write(path)
         cfg = replace(self.cfg, data_release=None, combine_dr1_qr3=True, save_raw_measurements=False,
                       reduce_oversampling=True, use_spectral_channels_for_binning=True,
-                      spectral_channels_bin_by='edges')
+                      spectral_channels_bin_by='edges', remove_outliers=True, outlier_detectors=(4,))
 
         with patch.object(p, 'download_calibration', side_effect=AssertionError('network used')):
             spectrum, measurements = p.run_spherex_pipeline(24.24, 9.56, 'synthetic', cfg)
@@ -121,6 +121,25 @@ class QR3ApertureTests(unittest.TestCase):
             channels.write(path, overwrite=True)
             with self.assertRaisesRegex(ValueError, 'spectral-channel grids differ'):
                 p.run_spherex_pipeline(24.24, 9.56, 'synthetic', cfg)
+
+    def test_combined_outlier_filter_preserves_sparse_d4_feature(self):
+        dr1 = Table({'WAVELENGTH': [3.49, 3.50, 3.51, 3.52, 3.53],
+                     'FLUX': [.10, .11, .10, .12, .11], 'ERR': [.01] * 5, 'DETECTOR': [4] * 5})
+        qr3 = Table({'WAVELENGTH': [3.55, 3.56, 3.57],
+                     'FLUX': [.39, .40, 2.0], 'ERR': [.01] * 3, 'DETECTOR': [4] * 3})
+        rows = [dict(wavelength=row['WAVELENGTH'], flux=row['FLUX'], err=row['ERR'],
+                     detector=4, photometry_method='aperture', aperture_radius_pix=2.,
+                     status='ok', data_release=release)
+                for release, table in [('dr1', dr1), ('qr3', qr3)] for row in table]
+        cfg = p.PipelineConfig(remove_outliers=True, reduce_oversampling=False)
+        spec = p.build_spectrum_table(rows, 2., include_release=True)
+        pooled = p.process_spectrum_table(spec, cfg)
+        separate = p.process_spectrum_table(spec, replace(cfg, combine_dr1_qr3=True))
+        self.assertEqual(len(pooled), 5)
+        expected = np.concatenate([p.process_spectrum_table(table, cfg)['WAVELENGTH']
+                                   for table in (dr1, qr3)])
+        np.testing.assert_array_equal(separate['WAVELENGTH'], expected)
+        self.assertEqual(len(separate), 7)
 
     def test_pipeline_skips_off_detector_exposure_but_rejects_invalid_geometry(self):
         good_path, _ = self.make_cutout()
