@@ -203,6 +203,31 @@ See [DR1 validation](validation/DR1.md) for the six-detector sample and
 reproduction commands, and [stage-four validation](validation/QR3_STAGE4.md)
 for the historical QR2/QR3 comparison.
 
+#### Preview the DR1 All-Sky Cube
+
+Run this separate command with ICRS coordinates in decimal degrees and the
+desired field wavelength in microns.
+
+```bash
+python -m spexpi.cube_preview 265.35 25.89 --wavelength 3.5 --output previews/t9
+```
+
+The command finds the covering tile through IRSA and caches it in
+`spherex_cube_cache/`. The first download is about 306 MiB per tile.
+Use `--cache-dir` to set the cache location or `--tile path/to/tile.fits`
+to preview a known local tile offline.
+
+The PNG shows the target pixel's spectrum and channel hit counts next to
+a field image at the closest cube wavelength. The marker shows the input
+position. The field is clipped at the tile boundary. The ECSV contains the
+102 channel samples, hit counts, flags, and a validity column. DR1 tiles
+provide hit counts as coverage and lack a variance extension.
+
+The cube preview samples surface brightness in one 12.9-arcsecond pixel.
+That pixel can include background and nearby sources. Use exposure-based
+extraction for point-source fluxes or per-epoch proper-motion correction.
+[IRSA cube documentation](https://irsa.ipac.caltech.edu/spherex-archive-documentation/spherex-data-products/#all-sky-cube-dr1-only)
+
 #### Combine DR1 and QR3 spectral measurements
 
 Use `combine_dr1_qr3=True` with `data_release=None` to extract one spectrum
