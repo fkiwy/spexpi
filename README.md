@@ -101,19 +101,23 @@ can be slower because remote FITS access may require reading large portions of t
 
 ### 3. Data release handling
 
-Set `PipelineConfig(data_release="qr2")` to select a release for archive queries
-and cached runs. With `data_release=None`, every input must have identifiable,
+Set `PipelineConfig(data_release="dr1")` for first-year spectral images
+(Surveys 1 and 2) or `data_release="qr3"` for Surveys 3 and 4. The selector
+applies to archive queries and cached runs. IRSA serves wide and deep DR1
+spectral images under the same `dr1/level2/` path. The DR1 All-Sky Cube uses
+a separate workflow. With `data_release=None`, every input must have identifiable,
 consistent provenance. Unknown releases, conflicting FITS/path metadata, and mixed
 release batches raise errors rather than falling back to QR2. Supported release
-identifiers are `qr1`, `qr2`, `qr2_deep`, and `qr3` (QR1 archive availability is
-independent of identifier recognition).
+identifiers are `dr1`, `qr3`, `qr2`, `qr2_deep`, and `qr1`. Run DR1 and
+QR3 separately. QR2 is a legacy cached or direct-download workflow. IRSA
+documents direct download availability through February 2027.
 
-**QR3 aperture and ePSF extraction are supported.** Set `data_release="qr3"`
-and choose `photometry_method="aperture"`, `"psf"`, or `"both"`. QR3 PSF fitting
+**DR1 and QR3 support aperture and ePSF extraction.** Choose
+`photometry_method="aperture"`, `"psf"`, or `"both"`. DR1 and QR3 PSF fitting
 uses the embedded `EPSF` binary table; QR2 retains its optical `PSF` cube path.
 The `"both"` mode writes independent aperture and PSF spectra.
 
-QR3 wavelengths and bandwidths are sampled bilinearly from full-resolution
+DR1 and QR3 wavelengths and bandwidths are sampled bilinearly from full-resolution
 `CWAVE`/`CBAND` calibration maps (`cal-swcs-v5-2026-191` by default), rather than
 from the approximate image spectral WCS. Both wavelength and pixel-area maps use
 sky detector coordinates: detectors 4–6 are already oriented correctly and are
@@ -123,7 +127,7 @@ cutout workers and loaded once per detector per run.
 
 ```python
 cfg = PipelineConfig(
-    data_release="qr3",
+    data_release="dr1",
     photometry_method="both",
     spectral_wcs_cache_dir="../resources/spherex_calibration_files/spectral_wcs",
     # Leave collection overrides unset to select release-specific calibrations.
@@ -137,11 +141,11 @@ the midpoint between the preceding upper and following lower limits, with the
 outer limits retained. These are wavelength bins, not a replacement for the
 geometrical channel map. This parsing correction also applies to QR2 tables, so
 rebinned results can differ slightly from older runs that inferred edges solely
-from centers. QR3 calibration failures do not silently select legacy bins. If a
-sparse spectrum cannot be integrated into channels, the measured unbinned points
-are retained with a warning.
+from centers. DR1 and QR3 calibration failures raise errors. If a sparse
+spectrum cannot be integrated into channels, the measured unbinned points are
+retained with a warning.
 
-QR3 ePSF fitting follows [IRSA's native-pixel rendering recipe](https://github.com/Caltech-IPAC/irsa-tutorials/blob/main/tutorials/spherex/spherex_psf.md).
+DR1 and QR3 ePSF fitting follows [IRSA's native-pixel rendering recipe](https://github.com/Caltech-IPAC/irsa-tutorials/blob/main/tutorials/spherex/spherex_psf.md).
 It selects the nearest zone center using parent-detector `XCENTER`/`YCENTER`,
 checks zone coverage, and reads `OVSMPX`/`OVSMPY`. It supports rectangular grids
 (including detector 3's 11 × 41 zones) and arbitrary table row ordering. Both the
@@ -154,8 +158,8 @@ renormalized to the surviving pixels. This yields flux in the finite calibrated
 model's normalization, without extrapolating unmeasured PSF wings. The fit solves
 for flux and constant background, optionally including a background gradient.
 Existing grid-search controls and `psf_max_reduced_chi2` remain available.
-`psf_shift_sign` applies to the QR2 optical model only; QR3 uses physical pixel
-coordinates directly. Missing or malformed QR3 models raise errors rather than
+`psf_shift_sign` applies to the QR2 optical model only; DR1 and QR3 use physical pixel
+coordinates directly. Missing or malformed ePSF models raise errors rather than
 falling back to optical-PSF processing.
 
 PSF errors are formal covariance errors at the chosen centroid. They do not
@@ -165,7 +169,7 @@ Tractor's simultaneous modelling of neighbouring sources. Inspect reduced chi-sq
 and masks before interpreting scientific differences from archive photometry.
 
 FITS outputs record `SAPMCOLL`, `SWCSCOLL`, `WAVESRC`, and (when channel binning is
-requested) `SCHCOLL`. QR3 PSF spectra also record `PSFMODEL=EPSF`, `PSFNORM=FULL`,
+requested) `SCHCOLL`. DR1 and QR3 PSF spectra also record `PSFMODEL=EPSF`, `PSFNORM=FULL`,
 `ERRTYPE=FORMAL`, and available embedded calibration reference IDs (`EPSFREF` and
 HISTORY). Raw PSF measurements include the selected zone, oversampling, reference
 ID, fit position and diagnostics. Raw measurements also record the sampled bandwidth and
@@ -183,16 +187,16 @@ Leave `sapm_collection` and `spectral_channels_collection` as `None` to choose:
 | Release | Solid-angle pixel map | Spectral channels |
 | --- | --- | --- |
 | QR2 / QR2 deep | `cal-sapm-v2-2025-164` | `cal-sch-v1-2026-106` |
-| QR3 | `cal-sapm-v3-2026-191` | `cal-sch-v2-2026-229` |
+| DR1 / QR3 | `cal-sapm-v3-2026-191` | `cal-sch-v2-2026-229` |
 
 Explicit collection strings remain expert overrides; they must match the input
-release. The QR3 channel filename is uncompressed `.fits`. These defaults were
-checked against the [public archive](https://nasa-irsa-spherex.s3.amazonaws.com/?list-type=2&prefix=qr3/&delimiter=/).
-See the [IRSA release documentation](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/overview_qr.html)
-for the distinction between QR3 observations and DR1 reprocessing.
+release. DR1 and QR3 use uncompressed `.fits` channel tables. They share
+collection IDs and use separate archive prefixes and local caches.
+[IRSA release documentation](https://irsa.ipac.caltech.edu/spherex-archive-documentation/spherex-data-releases/).
 
-For the reproducible cross-release validation results, scientific limits, and
-archive-service comparison status, see [stage-four validation](validation/QR3_STAGE4.md).
+See [DR1 validation](validation/DR1.md) for the six-detector sample and
+reproduction commands, and [stage-four validation](validation/QR3_STAGE4.md)
+for the historical QR2/QR3 comparison.
 
 Run the release regression tests with:
 
@@ -215,11 +219,11 @@ Aperture photometry is performed on calibrated cutout images. The source apertur
 target position. A local annulus is used to estimate the background, with configurable sigma clipping and background
 estimator (`mean`, `median`, or `mode`). Bad pixels are excluded from the source aperture and the background annulus.
 Known-source pixels (`SOURCE`, bit 21) are masked in the annulus, but retained
-for the target measurement. QR3 rejects an unusable background instead of silently
+for the target measurement. DR1 and QR3 reject an unusable background instead of silently
 relaxing that mask. Background uncertainties use the number of samples surviving
 both masking and sigma clipping.
 
-QR3 also rejects apertures that lose source area through excluded/nonfinite
+DR1 and QR3 also reject apertures that lose source area through excluded/nonfinite
 pixels, invalid variance or image boundaries. `aperture_masked_policy="allow"`
 explicitly permits reporting the surviving flux without a missing-light correction;
 raw measurements identify that condition. QR2 retains its legacy allow default.
@@ -229,8 +233,8 @@ The pipeline can measure multiple aperture radii for diagnostics but builds the 
 
 ### 6. PSF photometry
 
-PSF photometry uses the QR2 optical `PSF` cube or the QR3 `EPSF` table in the cutout.
-QR3 models are evaluated at native pixel centers for the source's subpixel
+PSF photometry uses the QR2 optical `PSF` cube or the DR1/QR3 `EPSF` table in the cutout.
+DR1 and QR3 models are evaluated at native pixel centers for the source's subpixel
 position; QR2 retains its optical-kernel shift/rebin path. A weighted linear fit
 solves for flux and background. See [data release handling](#3-data-release-handling)
 for normalization, uncertainty and isolated-source limitations.

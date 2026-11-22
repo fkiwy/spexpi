@@ -15,6 +15,7 @@ import io
 import json
 from pathlib import Path
 import sys
+from urllib.parse import urlsplit
 
 import astropy.units as u
 from astropy.io import fits
@@ -105,7 +106,8 @@ def validate_case(case, root, online, baseline):
         aperture_radii_pix=(2.,),selected_aperture_radius_pix=2.,
         show_download_progress=False,retries=1,reduce_oversampling=False,plot_spectrum=False,
         **{k:TARGET[k] for k in ('reference_epoch_yr','pmra_masyr','pmdec_masyr')})
-    url = 'https://irsa.ipac.caltech.edu/'+case['uri']+f"?center={TARGET['ra']},{TARGET['dec']}d&size=0.016667"
+    size_deg = case.get('size_deg', '0.016667')
+    url = 'https://irsa.ipac.caltech.edu/' + case['uri'] + f"?center={TARGET['ra']},{TARGET['dec']}d&size={size_deg}"
     directory = p.get_object_download_dir(cfg,TARGET['name'])
     path = directory/p.filename_from_uri(url,detector)
     if online:
@@ -132,12 +134,18 @@ def validate_case(case, root, online, baseline):
                       wavelength_um=row['central_wavelength_um'],mjd=float(row['mjd_avg']))
         for measurement in measurements:
             method=measurement['photometry_method']
-            if measurement['status']!='ok' or not np.isfinite(measurement['flux_uJy']) or measurement['err_uJy']<=0:
+            if measurement['status']!='ok' or not np.isfinite([measurement['flux_uJy'], measurement['err_uJy']]).all() or measurement['err_uJy']<=0:
                 raise AssertionError(f'{method} failed: {measurement.get("psf_status",measurement["status"])}')
             output[method]=dict(flux_uJy=float(measurement['flux_uJy']),error_uJy=float(measurement['err_uJy']))
             if method=='psf':
                 output[method]['reduced_chi2']=float(measurement['psf_reduced_chi2'])
-        if release=='qr3':
+        if release in p.EPSF_RELEASES:
+            bandwidth = row['bandwidth_um']
+            if row['wavelength_source'] != 'CWAVE' or not all(
+                np.isfinite(value) and value > 0 for value in (output['wavelength_um'], bandwidth)
+            ):
+                raise AssertionError('Invalid full-resolution wavelength or bandwidth')
+            output['bandwidth_um'] = float(bandwidth)
             reference=reference_epsf_fit(path,row,cfg,*maps[(release,detector)])
             output['reference']=reference
             for name,key in [('flux_uJy','flux_uJy'),('error_uJy','error_uJy')]:
@@ -171,7 +179,7 @@ def validate_case(case, root, online, baseline):
             p.download_calibration=original
 
 
-def validate_products(root, online):
+def validate_products(root, online, releases):
     """Exercise cache discovery, channel binning, both output paths and provenance."""
     results=[]
     original=p.download_calibration
@@ -180,16 +188,19 @@ def validate_products(root, online):
             raise RuntimeError('Offline product validation attempted a download')
         p.download_calibration=no_download
     try:
-        for release in ('qr2','qr3'):
+        for release in releases:
             cfg=p.PipelineConfig(data_release=release,photometry_method='both',query_irsa_for_cutouts=False,
                 download_dir=str(root/'data'),sapm_cache_dir=str(root/'sapm'),
                 spectral_wcs_cache_dir=str(root/'swcs'),spectral_channels_cache_dir=str(root/'channels'),
                 output_dir=str(root/'products'),enable_psf_local_grid_search=False,
                 psf_fit_background_gradient=True,aperture_radii_pix=(2.,),selected_aperture_radius_pix=2.,
                 show_download_progress=False,retries=1,reduce_oversampling=True,
-                spectral_channels_bin_by='edges',plot_spectrum=False,save_raw_measurements=True,
+                use_spectral_channels_for_binning=release == 'dr1', spectral_channels_bin_by='edges',
+                plot_spectrum=False,save_raw_measurements=True,
                 **{k:TARGET[k] for k in ('reference_epoch_yr','pmra_masyr','pmdec_masyr')})
-            spectra,measurements=p.run_spherex_pipeline(TARGET['ra'],TARGET['dec'],TARGET['name'],cfg)
+            spectra, _ = p.run_spherex_pipeline(TARGET['ra'], TARGET['dec'], TARGET['name'], cfg)
+            if set(spectra) != {'aperture', 'psf'}:
+                raise AssertionError(f'{release} did not produce both spectra')
             for method,table in spectra.items():
                 if len(table)!=6 or set(table['DETECTOR'])!=set(range(1,7)):
                     raise AssertionError(f'{release} {method} does not contain all six detectors')
@@ -197,7 +208,15 @@ def validate_products(root, online):
                 with fits.open(path) as hdul:
                     if hdul[0].header['DATAREL']!=release or hdul[0].header['PHOTMET']!=method:
                         raise AssertionError('Incorrect output provenance')
-                    if release=='qr3' and method=='psf' and hdul[0].header['PSFMODEL']!='EPSF':
+                    if release == 'dr1':
+                        expected = dict(WAVESRC='CWAVE', SRCMASK=p.bitmask(flag_policy.QR3_SOURCE_BITS),
+                                        BGMASK=p.bitmask(flag_policy.QR3_BACKGROUND_BITS))
+                        expected.update({key: p.calibration_collection(cfg, release, kind) for key, kind in
+                                         [('SAPMCOLL', 'sapm'), ('SWCSCOLL', 'spectral_wcs'),
+                                          ('SCHCOLL', 'spectral_channels')]})
+                        if any(hdul[0].header.get(key) != value for key, value in expected.items()):
+                            raise AssertionError('Incorrect DR1 calibration or mask provenance')
+                    if release in p.EPSF_RELEASES and method=='psf' and hdul[0].header['PSFMODEL']!='EPSF':
                         raise AssertionError('Missing EPSF provenance')
                 results.append(dict(release=release,method=method,points=len(table),status='passed'))
         return results
@@ -205,12 +224,12 @@ def validate_products(root, online):
         p.download_calibration=original
 
 
-def validate_images(root):
-    """Check QR2/QR3 image reprojection, masking, FITS writing and plotting."""
+def validate_images(root, releases):
+    """Check image reprojection, masking, FITS writing and plotting."""
     from spexpi.image_stacker import stack_images
     from spexpi.image_plotter import plot_images
     results=[]
-    for release in ('qr2','qr3'):
+    for release in releases:
         output=root/'images'/release
         # This small sample has one input per detector; retain the reference frame.
         images=stack_images(24.244929417,9.563023138,
@@ -232,32 +251,42 @@ def main():
     parser.add_argument('--cache-dir',type=Path,required=True)
     parser.add_argument('--online',action='store_true')
     parser.add_argument('--baseline-file',type=Path)
-    parser.add_argument('--manifest',type=Path,
-        default=Path(__file__).resolve().parents[1]/'validation/qr3-stage4-manifest.json',
-        help='Frozen sample manifest; defaults to the checked-in stage-four sample')
+    parser.add_argument('--release', choices=('dr1',), help='Validate DR1 instead of the QR2/QR3 sample')
+    parser.add_argument('--manifest', type=Path, help='Override the checked-in sample manifest')
     args=parser.parse_args()
     root=args.cache_dir.resolve()
     checkout=Path(__file__).resolve().parents[1]
     if root==checkout or checkout in root.parents:
         parser.error('Use a cache directory outside the repository checkout')
     root.mkdir(parents=True,exist_ok=True)
+    releases = (args.release,) if args.release else ('qr2', 'qr3')
+    default_manifest = 'dr1-manifest.json' if args.release else 'qr3-stage4-manifest.json'
+    source_manifest = args.manifest or checkout / 'validation' / default_manifest
     manifest=root/'manifest.json'
-    if not manifest.exists() and args.manifest.exists():
-        manifest.write_text(args.manifest.read_text())
+    if not manifest.exists() and source_manifest.exists():
+        manifest.write_text(source_manifest.read_text())
     if not manifest.exists():
         if not args.online:
             parser.error('No cached manifest; use --online to select and download the sample')
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures=[executor.submit(discover,r,d) for r in ('qr2','qr3') for d in range(1,7)]
+            futures=[executor.submit(discover,r,d) for r in releases for d in range(1,7)]
             cases=[future.result() for future in futures]
         manifest.write_text(json.dumps(dict(target=TARGET,cases=cases),indent=2)+'\n')
     frozen=json.loads(manifest.read_text())
     if frozen['target'] != TARGET:
         parser.error('Cached target differs from the fixed validation target')
     cases=frozen['cases']
-    expected={(release,detector) for release in ('qr2','qr3') for detector in range(1,7)}
-    if len(cases)!=12 or {(case['release'],case['detector']) for case in cases} != expected:
+    expected={(release,detector) for release in releases for detector in range(1,7)}
+    if len(cases)!=len(expected) or {(case['release'],case['detector']) for case in cases} != expected:
         parser.error('Manifest must contain exactly one case per release and detector')
+    if args.online and args.release == 'dr1':
+        cfg = p.PipelineConfig(data_release='dr1')
+        archive_rows = p.query_spherex_cutouts(TARGET['ra'], TARGET['dec'], cfg)
+        archive_paths = {urlsplit(uri).path.lstrip('/') for uri in archive_rows['uri']}
+        if (not all(path.startswith('ibe/data/spherex/dr1/level2/') for path in archive_paths)
+                or not {case['uri'] for case in cases}.issubset(archive_paths)):
+            raise RuntimeError('Live DR1 discovery did not return the expected spectral images')
+        print(f'Discovered {len(archive_rows)} DR1 spectral images', flush=True)
     baseline=load_baseline(args.baseline_file) if args.baseline_file else None
     provenance=dict(flag_policy_sha256=hashlib.sha256(Path(flag_policy.__file__).read_bytes()).hexdigest(),
                     validation_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -278,8 +307,8 @@ def main():
     images=[]
     if not failed:
         try:
-            products=validate_products(root,args.online)
-            images=validate_images(root)
+            products=validate_products(root,args.online,releases)
+            images=validate_images(root,releases)
         except Exception as error:
             products=[dict(status='failed',error=f'{type(error).__name__}: {error}')]
             failed+=1

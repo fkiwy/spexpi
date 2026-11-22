@@ -135,7 +135,7 @@ psf_local_grid_half_range_pix = 1.0
 outlier_nbr_of_bins = 8
 
 cfg = PipelineConfig(
-    data_release="qr3",  # Use "qr2" to re-extract earlier-release images separately.
+    data_release="qr3",  # Use "dr1" for first-year images.
 
     # ============================================================
     # 1. PHOTOMETRY MODE & CORE SETTINGS

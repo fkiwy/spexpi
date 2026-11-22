@@ -11,16 +11,17 @@ from spexpi import spherex_pipeline as p
 
 class ReleaseTests(unittest.TestCase):
     def test_supported_aliases_and_boundaries(self):
-        for release in ('qr1', 'qr2', 'qr2_deep', 'qr3'):
+        for release in ('qr1', 'qr2', 'qr2_deep', 'qr3', 'dr1'):
             with self.subTest(release=release):
                 self.assertEqual(p.normalize_data_release('SPHEREx_' + release.upper()), release)
                 for uri in (f's3://nasa-irsa-spherex/{release}/level2/a.fits',
                             f'https://irsa.ipac.caltech.edu/ibe/data/spherex/{release}/a.fits?x=1',
                             f'{release}/a.fits'):
                     self.assertEqual(p.infer_data_release_from_uri(uri), release)
-        for bad in ('qr30', 'my_qr2', 'dr1', None):
+        for bad in ('qr30', 'my_qr2', 'dr10', 'spherex_dr1_cube', None):
             self.assertEqual(p.normalize_data_release(bad), 'unknown')
         self.assertEqual(p.infer_data_release_from_uri('/data/qr30/a.fits'), 'unknown')
+        self.assertEqual(p.normalize_data_release('SPHEREx_DR1_DEEP'), 'dr1')
         self.assertEqual(p.s3_key_from_irsa_uri('qr3/level2/a.fits'), 'qr3/level2/a.fits')
 
     def test_fits_unknown_and_conflicting_provenance(self):
@@ -45,7 +46,7 @@ class ReleaseTests(unittest.TestCase):
     def test_single_release_required(self):
         rows = lambda *rs: [{'data_release': r} for r in rs]
         self.assertEqual(p.require_single_data_release(rows('qr3', 'qr3')), 'qr3')
-        for inputs in ([], rows('unknown'), rows('qr2', 'unknown'), rows('qr2', 'qr3')):
+        for inputs in ([], rows('unknown'), rows('qr2', 'unknown'), rows('qr2', 'qr3'), rows('dr1', 'qr3')):
             with self.assertRaises(ValueError):
                 p.require_single_data_release(inputs)
         with self.assertRaises(ValueError):
@@ -57,6 +58,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('/qr3/solid_angle_pixel_map/cal-sapm-v3-2026-191/', p.make_sapm_s3_paths(cfg, 'qr3')[1])
         self.assertTrue(p._default_spectral_channels_s3_candidates(cfg, 'qr2')[0].endswith('cal-sch-v1-2026-106.fits.gz'))
         self.assertTrue(p._default_spectral_channels_s3_candidates(cfg, 'qr3')[0].endswith('cal-sch-v2-2026-229.fits'))
+        self.assertIn('/dr1/solid_angle_pixel_map/cal-sapm-v3-2026-191/', p.make_sapm_s3_paths(cfg, 'dr1')[1])
+        self.assertIn('/dr1/spectral_channels/', p._default_spectral_channels_s3_candidates(cfg, 'dr1')[0])
+        self.assertTrue(p._default_spectral_channels_s3_candidates(cfg, 'dr1')[0].endswith('cal-sch-v2-2026-229.fits'))
         cfg.sapm_collection = 'custom'
         self.assertIn('/custom/', p.make_sapm_s3_paths(cfg, 'qr3')[1])
         with self.assertRaises(ValueError):
@@ -128,6 +132,9 @@ class ReleaseTests(unittest.TestCase):
             p.query_spherex_cutouts(1., 2., p.PipelineConfig(data_release='qr3'))
             query = service.return_value.search.call_args.args[0]
             self.assertIn("a.uri LIKE '%/spherex/qr3/%'", query)
+            p.query_spherex_cutouts(1., 2., p.PipelineConfig(data_release='dr1'))
+            query = service.return_value.search.call_args.args[0]
+            self.assertIn("a.uri LIKE '%/spherex/dr1/level2/%'", query)
 
     def test_pipeline_guards_before_photometry_and_isolates_outputs(self):
         for releases, error in ((['qr2', 'qr3'], ValueError), (['unknown'], ValueError)):

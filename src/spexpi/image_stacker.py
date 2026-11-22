@@ -228,19 +228,23 @@ def _reproject_plane_to_optimal_wcs(
 
 def _stack_mask_policy(hdul, path, override):
     releases = {str(h.header.get("DATAREL", "")).lower() for h in hdul}
-    releases &= {"qr1", "qr2", "qr2_deep", "qr3"}
-    in_qr3_path = "qr3" in Path(path).parts
-    if len(releases) > 1 or (in_qr3_path and releases and releases != {"qr3"}):
+    releases &= {"qr1", "qr2", "qr2_deep", "qr3", "dr1"}
+    release_paths = {"qr3", "dr1"}.intersection(Path(path).parts)
+    releases |= release_paths
+    if len(releases) > 1:
         raise ValueError("Conflicting release provenance in image stack input")
-    is_qr3 = "qr3" in releases or in_qr3_path
-    if not releases and not is_qr3:
+    release = next(iter(releases), None)
+    if release is None:
         try:
-            is_qr3 = Version(str(hdul[0].header.get("VERSION", "0"))).major >= 7
+            if Version(str(hdul[0].header.get("VERSION", "0"))).major >= 7:
+                release = "qr3"
         except ValueError:
             pass
-    if override is not None:
-        return tuple(override), "qr3_custom" if is_qr3 else "legacy_custom"
-    return (QR3_MOSAIC_BITS, "qr3_mosaic") if is_qr3 else (LEGACY_FATAL_BITS, "legacy")
+    if release in ("dr1", "qr3"):
+        if override is not None:
+            return tuple(override), f"{release}_custom"
+        return QR3_MOSAIC_BITS, f"{release}_mosaic"
+    return (tuple(override), "legacy_custom") if override is not None else (LEGACY_FATAL_BITS, "legacy")
 
 
 def _reproject_flags(flags, header, wcs, shape):
@@ -474,7 +478,7 @@ def stack_images(
         Aperture and background-annulus radii in pixels. These values are not
         used for the stacking itself; they are returned for downstream plotting.
     fatal_flag_bits:
-        Override FLAGS exclusions. None selects the QR3 mosaic or legacy policy
+        Override FLAGS exclusions. None selects the DR1/QR3 mosaic or legacy policy
         from file provenance/version. Input science is masked before reprojection.
     include_reference_image:
         If ``True`` (recommended), include the first chronologically sorted
